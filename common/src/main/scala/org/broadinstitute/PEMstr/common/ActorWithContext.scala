@@ -42,7 +42,7 @@ trait ActorWithContext extends Actor with ActorLogging {
 	/**
 	 * Type to be set by subclass to actual context class
  	 */
-	type MyContext <: MutableContext
+	protected type MyContext <: MutableContext
 
 	/**
 	 * Callback to subclass to create initial instance of context

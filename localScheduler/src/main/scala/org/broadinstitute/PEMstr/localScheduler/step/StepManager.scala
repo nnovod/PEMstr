@@ -44,6 +44,11 @@ import java.io.{FileWriter,FileNotFoundException,File}
 import java.net.InetSocketAddress
 import java.nio.channels.ServerSocketChannel
 import scala.util.{Failure, Success}
+import org.broadinstitute.PEMstr.common.ActorWithContext.MutableContext
+import akka.actor.OneForOneStrategy
+import akka.actor.SupervisorStrategy._
+import scala.concurrent.duration._
+
 
 /**
  * @author Nathaniel Novod
@@ -53,17 +58,32 @@ import scala.util.{Failure, Success}
  * Top level actor to manage the execution of a step.  Life really starts when it receives a YourStep message
  * specifying the particulars of a step to be executed.
  */
-class StepManager extends Actor with ActorLogging {
+class StepManager extends ActorWithContext {
+
 	/**
-	 * Used to track state of input data used for step execution
+	 * A simple strategy for now - abort child on exception and then abort the step
+ 	 */
+	override val supervisorStrategy =
+		OneForOneStrategy(maxNrOfRetries = 0, withinTimeRange = 1.minute) {
+			case _: Exception ⇒ {
+				self ! AbortStep
+				Stop
+			}
+		}
+
+	/**
+	 * Used to track state of input data used for step execution.  Note that access to this class and other items
+	 * following is a bit strange (protected to ourselves) because it must be seen within LocalContext which must be
+	 * used for getMyContext which is an override of a protected method in a super class.  Ideally the use of
+	 * protected[StepManager] could be replaced by a simple private but that's not possible.
 	 *
  	 * @param port socket port # used (valid if and only if the socket is open)
 	 * @param socket socket channel used (valid if and only if the socket is open)
 	 * @param listening tracks once we're listening on the socket
 	 * @param connection tracks how input connection has been made
 	 */
-	private case class InputData(port: Int, socket: ServerSocketChannel, listening: StartTracker,
-	                             connection: ValueTracker[DataFlow])
+	protected[StepManager] case class InputData(port: Int, socket: ServerSocketChannel, listening: StartTracker,
+	                                            connection: ValueTracker[DataFlow])
 
 	/**
 	 * Used to track state of output data used for step execution
@@ -71,38 +91,56 @@ class StepManager extends Actor with ActorLogging {
  	 * @param flows outputs for step
 	 * @param pipeActor actor used for output pipe
 	 */
-	private case class OutputData(flows: Array[DataFlow], pipeActor: ValueTracker[ActorRef])
+	protected[StepManager] case class OutputData(flows: Array[DataFlow], pipeActor: ValueTracker[ActorRef])
 
-	/* Saved parameters about step to be executed */
-	private val stepParams = new ValueTracker[YourStep]
-	/* Saved input settings */
-	private val inputData = new ValueTracker[Map[String, InputData]]
-	/* Saved output settings */
-	private val outputData = new ValueTracker[Map[String, OutputData]]
-	/* Where to send back message if setup completed (should be remote WorkflowManager) */
-	private val actorToReplyToWhenSetup = new ValueTracker[ActorRef]
-	/* Where to send back status messages to (should also be remote WorkflowManager) */
-	private val actorToTrackWorkflowStatus = new ValueTracker[ActorRef]
-	/* Other place to send back message when we're done (should be LocalScheduler) */
-	private val actorWhoGaveUsStep = new ValueTracker[ActorRef]
-	/* Flag to indicate that the process to be executed for this step has been started */
-	private val processStarted = new StartTracker
-	/* Status to indicate that the process to be executed for this step has been started */
-	private val processCompleted = new ValueTracker[Int]
-	/* Process running for step */
-	private val process = new ValueTracker[Process]
-	/* We're done - just waiting to cleanup */
-	private val done = new StartTracker
-	/* Temp directory used */
-	private val tempDirCreated = new ValueTracker[String]
-	/* Log directory used */
-	private val logDirCreated = new ValueTracker[String]
+	/**
+	 * Actor context - it is saved in instance between invocations of actor and also restored to any new instances
+	 * of the actor that get created due to restarts.  value "locals" is used to refer to context.
+	 */
+	protected[StepManager] class LocalContext extends MutableContext {
+		/* Saved parameters about step to be executed */
+		val stepParams = new ValueTracker[YourStep]
+		/* Saved input settings */
+		val inputData = new ValueTracker[Map[String, InputData]]
+		/* Saved output settings */
+		val outputData = new ValueTracker[Map[String, OutputData]]
+		/* Where to send back message if setup completed (should be remote WorkflowManager) */
+		val actorToReplyToWhenSetup = new ValueTracker[ActorRef]
+		/* Where to send back status messages to (should also be remote WorkflowManager) */
+		val actorToTrackWorkflowStatus = new ValueTracker[ActorRef]
+		/* Other place to send back message when we're done (should be LocalScheduler) */
+		val actorWhoGaveUsStep = new ValueTracker[ActorRef]
+		/* Flag to indicate that the process to be executed for this step has been started */
+		val processStarted = new StartTracker
+		/* Status to indicate that the process to be executed for this step has been started */
+		val processCompleted = new ValueTracker[Int]
+		/* Process running for step */
+		val process = new ValueTracker[Process]
+		/* We're done - just waiting to cleanup */
+		val done = new StartTracker
+		/* Temp directory used */
+		val tempDirCreated = new ValueTracker[String]
+		/* Log directory used */
+		val logDirCreated = new ValueTracker[String]
+	}
+
+	/**
+	 * What our context looks like
+ 	 */
+	override protected[StepManager] type MyContext = LocalContext
+
+	/**
+	 * Create a new context.
+	 *
+	 * @return new instance of local context
+	 */
+	override protected[StepManager] def getMyContext = new LocalContext
 
 	/**
 	 * Check if the step is all done.  If the associated process has completed and all children are done then we're
 	 * done as well.
 	 */
-	private def isStepDone = processCompleted.isSet && context.children.forall(_.isTerminated)
+	private def isStepDone = locals.processCompleted.isSet && context.children.forall(_.isTerminated)
 
 	/**
 	 * Check if the step is all done.  If the associated process has completed and all children are done then we're
@@ -116,12 +154,12 @@ class StepManager extends Actor with ActorLogging {
 	 * Shut down the actor. Send a message back saying we're done to interested parties.
  	 */
 	private def weAreDone() {
-		if (!done.isSet) { // Make sure we only send out the messages once
-			val doneVal = if (processCompleted.isSet) processCompleted() else 1
-			val doneMsg = StepDone(stepParams().stepName, doneVal)
-			if (actorToTrackWorkflowStatus.isSet) actorToTrackWorkflowStatus() ! doneMsg
-			actorWhoGaveUsStep() ! doneMsg
-			done.set()
+		if (!locals.done.isSet) { // Make sure we only send out the messages once
+			val doneVal = if (locals.processCompleted.isSet) locals.processCompleted() else 1
+			val doneMsg = StepDone(locals.stepParams().stepName, doneVal)
+			if (locals.actorToTrackWorkflowStatus.isSet) locals.actorToTrackWorkflowStatus() ! doneMsg
+			locals.actorWhoGaveUsStep() ! doneMsg
+			locals.done.set()
 		}
 	}
 
@@ -132,14 +170,14 @@ class StepManager extends Actor with ActorLogging {
 	 * @return true if all the input are either listening on a socket or are not using a socket
 	 */
 	private def isEveryoneListening =
-		inputData().values.forall((data) => data.listening.isSet || !data.socket.isOpen)
+		locals.inputData().values.forall((data) => data.listening.isSet || !data.socket.isOpen)
 
 	/**
 	 * Get an iterator over the input connections
 	 *
  	 * @return iterable collection of input data flow information
 	 */
-	private def getInputConnections = inputData().values.map(_.connection())
+	private def getInputConnections = locals.inputData().values.map(_.connection())
 
 	/**
 	 * Init all the input streams with port/socket information and place to set other values later.
@@ -173,7 +211,7 @@ class StepManager extends Actor with ActorLogging {
 	 * @return optional input data found
 	 */
 	private def findInputData(portNumber: Int) =
-		inputData().values.find(_.port == portNumber)
+		locals.inputData().values.find(_.port == portNumber)
 
 	/**
 	 * Method to startup the process and send a message when it completes.  The process is run in
@@ -183,11 +221,11 @@ class StepManager extends Actor with ActorLogging {
 	 */
 	private def runStepProcess() {
 		/* If the process has already been started then there's nothing to do */
-		if (!processStarted.isSet  && !done.isSet) {
+		if (!locals.processStarted.isSet  && !locals.done.isSet) {
 			/* Flag that the process is being started */
-			processStarted.set()
+			locals.processStarted.set()
 			/* Retrieve settings for step - it must have already been setup before we get here */
-			val stepSettings = stepParams()
+			val stepSettings = locals.stepParams()
 
 			/**
 			 * Open a file writer for logging
@@ -197,7 +235,7 @@ class StepManager extends Actor with ActorLogging {
 			 * @return open FileWriter and associated File
 			 */
 			def logFile(fileExtension: String) = {
-				val file = new File(logDirCreated() + "/" + stepSettings.stepName + fileExtension)
+				val file = new File(locals.logDirCreated() + "/" + stepSettings.stepName + fileExtension)
 				(new FileWriter(file), file)
 			}
 			/**
@@ -265,7 +303,7 @@ class StepManager extends Actor with ActorLogging {
 						(error) => errLog._1.write(error + "\n")
 					)
 					val processRunning = processToRun.run(processLogger)
-					process() = processRunning
+					locals.process() = processRunning
 					/**
 					 * Now we wait for completion of the process by using a Future to run the expression that waits for
 					 * completion in a separate thread.  The expression looks for the running process' exit value, so it
@@ -303,7 +341,8 @@ class StepManager extends Actor with ActorLogging {
 	 * no data coming) we can delay running the process until there's actually data to work on.
  	 */
 	private def delayedProcessStart() {
-		log.debug("Received socket data when process " + (if (processStarted.isSet) "is" else "not") + " started")
+		log.debug("Received socket data when process " +
+			(if (locals.processStarted.isSet) "is" else "not") + " started")
 		runStepProcess()
 	}
 
@@ -531,7 +570,7 @@ class StepManager extends Actor with ActorLogging {
 		 */
 		def findOutputFileName(name: String) = {
 			/* Check if flow is in outputs. If not there then we're in trouble. */
-			val spec = findFileSpec(name, outputData().values.flatMap(_.flows),
+			val spec = findFileSpec(name, locals.outputData().values.flatMap(_.flows),
 				() => getOutputName(settings, settings.stepName, name, settings.tempDir))
 			assert(spec.isDefined, "Couldn't find output stream to substitute for \"" + name +
 			  "\" in step \"" + settings.stepName + "\"")
@@ -630,7 +669,7 @@ class StepManager extends Actor with ActorLogging {
 	 * @return optional reference to actor managing source step for flow
  	 */
 	private def getSourceStepActor(flow: String) : Option[ActorRef]= {
-		inputData().get(flow) match {
+		locals.inputData().get(flow) match {
 			case Some(input) => if (!input.connection.isSet) None else input.connection() match {
 				case DataFlowSocket(_, _, sourceActor) => {
 					Some(sourceActor)
@@ -653,8 +692,7 @@ class StepManager extends Actor with ActorLogging {
 	 * @param msg message to send to flow actor
 	 */
 	private def flowChange(flow: String, msg: OutputPipeFlow) {
-
-		outputData().get(flow) match {
+		locals.outputData().get(flow) match {
 			case Some(output) => if (output.pipeActor.isSet) output.pipeActor() ! msg else flowNotFound(flow)
 			case None => flowNotFound(flow)
 		}
@@ -683,26 +721,26 @@ class StepManager extends Actor with ActorLogging {
 				if (!mkdir(dir)) throw new FileNotFoundException("Error creating directory " + dir)
 			}
 			/* Save step info - note this actor should only get one YourStep message */
-			stepParams() = myStep
+			locals.stepParams() = myStep
 			/* Make sure temporary directory for workflow exists locally */
 			mkLocalDir(tempDir)
-			tempDirCreated() = tempDir
+			locals.tempDirCreated() = tempDir
 			/* Make sure log directory for workflow exists locally */
 			mkLocalDir(logDir)
-			logDirCreated() = logDir
+			locals.logDirCreated() = logDir
 			/*
 			 * Get a socket port for each input and remember the related server socket created
 			 * This is a bit ugly since we have to get rid of the port later (see StartStep) if it's never used
 			 * because the input is piped
 			 */
-			inputData() = initInputData(stepDef)
-			val inputPorts = inputData().map((i) => {
+			locals.inputData() = initInputData(stepDef)
+			val inputPorts = locals.inputData().map((i) => {
 				val (streamName, data) = i
 				streamName -> InputConnectionInfo(data.port, getInputName(name, streamName, tempDir))
 			})
 			/* Respond that we're happily taking on the step */
 			replyTo ! TakingStep(name, wfID, inputPorts)
-			actorWhoGaveUsStep() = sender
+			locals.actorWhoGaveUsStep() = sender
 		}
 
 		/*
@@ -712,16 +750,16 @@ class StepManager extends Actor with ActorLogging {
 		 */
 		case SetupInputs(inputs: Map[String, DataFlow]) => {
 			/* Get saved step settings */
-			val stepSettings = stepParams()
+			val stepSettings = locals.stepParams()
 			/*
 			 * Input is of two types:
 			 * - socket input that we receive from another step via a socket and then pipe into our step
 			 * - piped input that we receive directly from an output pipe from a previous step
 			 *
 			 * For piped input we don't do anything except create the pipe since the data is going directly between
-			 * the executing step's processes via the pipe.  This is most efficient, however not always possible.
+			 * the executing steps' processes via the pipe.  This is most efficient, however not always possible.
 			 * In particular, if the two steps are executing on different nodes or the input being received is being
-			 * sent by the previous step to multiple destination then sockets must be used.
+			 * sent by the previous step to multiple destinations then sockets must be used.
 			 *
 			 * For each socket input we setup a bus that can be subscribed to to know about events on the socket.  Each
 			 * input subscribes to the bus in order to know when any data is received so that we know when to start
@@ -736,7 +774,7 @@ class StepManager extends Actor with ActorLogging {
 			for (input <- inputs)  {
 				val (iName, iData) = input
 				/* Save the DataFlow associated with the input */
-				inputData()(iName).connection() = iData
+				locals.inputData()(iName).connection() = iData
 				iData match {
 					/*
 					 * Input is being received over a socket  - do all the initial setup to get the socket ready
@@ -769,13 +807,13 @@ class StepManager extends Actor with ActorLogging {
 					/* Input is received directly over a pipe - just make the pipe and close unused socket */
 					case DataFlowPipe(_, pipe) => {
 						mkfifo(pipe)
-						inputData()(iName).socket.close()
+						locals.inputData()(iName).socket.close()
 					}
 				}
 			}
 
 			/* Save who to send message to when we're all setup (input sockets are ready) */
-			actorToReplyToWhenSetup() = sender
+			locals.actorToReplyToWhenSetup() = sender
 			/* Check if we can send out the setup message now */
 			if (isEveryoneListening) sender ! InputsAreSetup(stepSettings.stepName)
 		}
@@ -789,7 +827,7 @@ class StepManager extends Actor with ActorLogging {
 				case Some(data) => data.listening.set()
 				case None =>
 			}
-			if (isEveryoneListening) actorToReplyToWhenSetup() ! InputsAreSetup(stepParams().stepName)
+			if (isEveryoneListening) locals.actorToReplyToWhenSetup() ! InputsAreSetup(locals.stepParams().stepName)
 		}
 
 		/*
@@ -799,9 +837,9 @@ class StepManager extends Actor with ActorLogging {
 		 */
 		case myOutputs @ SetupOutputs(outputs: Map[String, Array[DataFlow]]) => {
 			/* Get saved step settings */
-			val stepSettings = stepParams()
+			val stepSettings = locals.stepParams()
 			/* Save connection info */
-			outputData() = myOutputs.outputs.map((entry) => {
+			locals.outputData() = myOutputs.outputs.map((entry) => {
 				val (name, outputs) = entry
 				name -> OutputData(outputs, new ValueTracker[ActorRef])
 			})
@@ -843,7 +881,7 @@ class StepManager extends Actor with ActorLogging {
 					context.actorOf(Props(new StepOutputPipe(consumers.toMap, outputFileName, bufferOptions)),
 						name = "output_" + outputName)
 				context.watch(outputPipeActor)
-				outputData()(outputName).pipeActor() = outputPipeActor
+				locals.outputData()(outputName).pipeActor() = outputPipeActor
 			}
 			sender ! StepSetup(stepSettings.stepName)
 		}
@@ -858,9 +896,9 @@ class StepManager extends Actor with ActorLogging {
 		case StartStep => {
 			log.info("Starting step")
 			if (getInputConnections.exists((inp) => inp.isPipe) ||
-				stepParams().stepDef.inputs.size == 0) runStepProcess()
+				locals.stepParams().stepDef.inputs.size == 0) runStepProcess()
 			/* Save who to send message to when we're done */
-			actorToTrackWorkflowStatus() = sender
+			locals.actorToTrackWorkflowStatus() = sender
 		}
 
 		/*
@@ -869,8 +907,8 @@ class StepManager extends Actor with ActorLogging {
 		 */
 		case AbortStep => {
 			log.info("Abort step received")
-			if (process.isSet && !processCompleted.isSet) process().destroy() else
-				if (processCompleted.isSet) shutdownChildren() else self ! ProcessDone(1)
+			if (locals.process.isSet && !locals.processCompleted.isSet) locals.process().destroy() else
+				if (locals.processCompleted.isSet) shutdownChildren() else self ! ProcessDone(1)
 		}
 
 		/*
@@ -881,9 +919,9 @@ class StepManager extends Actor with ActorLogging {
 		 * value: process completion status
 		 */
 		case ProcessDone(value) => {
-			if (!processCompleted.isSet) { // May already be complete in case of abort(s)
+			if (!locals.processCompleted.isSet) { // May already be complete in case of abort(s)
 				log.info("Process completed with status " + value)
-				processCompleted() = value
+				locals.processCompleted() = value
 			}
 			if (value != 0) shutdownChildren()
 			if (isStepDone) weAreDone()
@@ -959,8 +997,8 @@ class StepManager extends Actor with ActorLogging {
 		 */
 		case CleanupStep => {
 			log.info("cleanup")
-			if (tempDirCreated.isSet) {
-				val dirF = new File(tempDirCreated())
+			if (locals.tempDirCreated.isSet) {
+				val dirF = new File(locals.tempDirCreated())
 				try {
 					for (file <- dirF.listFiles() if file != null) file.delete()
 				} catch {

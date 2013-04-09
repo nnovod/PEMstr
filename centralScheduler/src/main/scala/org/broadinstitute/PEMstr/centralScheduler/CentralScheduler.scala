@@ -54,7 +54,7 @@ class CentralScheduler extends ActorWithContext {
 	 * Actor context - it is saved in instance between invocations of actor and also restored to any new instances
 	 * of the actor that get created due to restarts.
 	 */
-	protected class LocalContext extends MutableContext {
+	protected[CentralScheduler] class LocalContext extends MutableContext {
 		/* bus on which we are publishing */
 		val eventBus = new StepExecutionRequestBus
 
@@ -75,7 +75,7 @@ class CentralScheduler extends ActorWithContext {
 	 *
 	 * @return new instance of local context
 	 */
-	override protected def getMyContext = new LocalContext
+	override protected[CentralScheduler] def getMyContext = new LocalContext
 
 	/**
 	 * Executed before the actor starts up.  We subscribe to any remote client shutdowns so we can take them off the
