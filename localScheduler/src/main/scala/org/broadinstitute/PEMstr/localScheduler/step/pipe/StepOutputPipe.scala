@@ -26,16 +26,17 @@ package org.broadinstitute.PEMstr.localScheduler.step.pipe
 
 import akka.actor._
 import scala.concurrent.duration._
-import StepOutputPipe.{ReadData, PausePipe, ResumePipe}
+import org.broadinstitute.PEMstr.localScheduler.step.pipe.StepOutputPipe.{ReadDataNeedBuffer,ReadData,PausePipe,ResumePipe}
 import scala.concurrent.Future
 import java.nio.ByteBuffer
 import collection.immutable.Map
 import org.broadinstitute.PEMstr.common.util.file.FileInputStreamTracker
-import org.broadinstitute.PEMstr.localScheduler.util.dataQueue.DataQueue
+import org.broadinstitute.PEMstr.localScheduler.util.dataQueue.{ByteBufferBufferingQueue,DataQueue}
 import util.{Failure, Success}
 import org.broadinstitute.PEMstr.localScheduler.LocalScheduler.futureExecutor
 import annotation.tailrec
 import org.broadinstitute.PEMstr.common.workflow.WorkflowDefinitions.BufferSettings
+import org.broadinstitute.PEMstr.common.util.ReportBuffers
 
 /**
  * @author Nathaniel Novod
@@ -52,8 +53,18 @@ import org.broadinstitute.PEMstr.common.workflow.WorkflowDefinitions.BufferSetti
  */
 
 class StepOutputPipe(consumers: Map[String, ActorRef], output: String,
-                     buffering: BufferSettings) extends Actor with ActorLogging {
+                     buffering: BufferSettings)
+	extends Actor with ActorLogging with ByteBufferBufferingQueue {
 
+	/**
+	 * Reporter for multi buffering usage
+ 	 */
+	private val bufReport = new ReportBuffers
+
+	/**
+	 * Set level for multi buffering
+ 	 */
+	final override protected val bufferingLevel = buffering.getMultiLvl
 	/**
 	 * If positive then it's time to pause
  	 */
@@ -113,9 +124,49 @@ class StepOutputPipe(consumers: Map[String, ActorRef], output: String,
 	}
 
 	/**
+	 * Process new buffer of data that has been read.  We publish that the data has arrived to interested parties.
+	 *
+ 	 * @param data byte data read
+	 * @param eof true if end-of-file reached
+	 */
+	private def processData(data: ByteBuffer, eof: Boolean) {
+		if (data.position > 0 || eof) {
+			if (eof) log.info(bufReport.getCurrentReport(getReportIntro("a total of ")))
+			if (data.position > 0) {
+				if (debugEnabled)
+					log.debug("Publishing " + data.position + " bytes of data for " + output)
+				dataQueue.publishData(data, eof)
+			} else {
+				log.info("Publishing end-of-file for " + output)
+				dataQueue.publishEndOfData()
+			}
+		}
+	}
+
+	/**
+	 * Get introduction for report of queue usage: "Buffering for (actir) refilled (intro)"
+	 *
+ 	 * @param intro end of intro string
+	 *
+	 * @return beginning of report
+	 */
+	private def getReportIntro(intro: String) = {
+		"Buffering for " + self.path.name + " refilled " + intro
+	}
+
+	/**
+	 * Method to maintain and periodically report on # of times buffers queue had to be refilled
+	 *
+	 * @param i # of items to
+	 */
+	private def doReport(i: Int) {
+		val report = bufReport.dataReport(getReportIntro(""), i)
+		if (report.isDefined) log.info(report.get)
+	}
+
+	/**
 	 * Method called to read data from the pipe.  When we've read the wanted amount of data we send a message back
 	 * to the actor with the data read.
-	 *
  	 */
 	private def read() {
 		/**
@@ -142,17 +193,25 @@ class StepOutputPipe(consumers: Map[String, ActorRef], output: String,
 			}
 		} else {
 			/**
-			 * Use a future to read the data but don't mess with the data queue outside actor thread
+			 * Make sure we have buffers available
 			 */
-			val buf = dataQueue.getBuffer
+			fillBufferQueue(dataQueue)
+			/**
+			 * Use a future to read the data but don't mess with the data queue outside actor thread.
+			 */
 			Future {
-				readData(inputStream, buf)
+				useQueue((buf, bufsLeft) => {
+					val (data, eof) = readData(inputStream, buf)
+					val bufsToGo = bufsLeft
+					if (bufsToGo > 0) {
+						self ! ReadData(data, eof)
+					} else {
+						self ! ReadDataNeedBuffer(data, eof)
+					}
+					!eof && bufsToGo != 0
+				})
 			} onComplete {
-				case Success(result) => {
-					val (data, eof) = result
-					/* We got stuff - go send message to ourselves that the data has arrived */
-					self ! ReadData(data, eof)
-				}
+				case Success(result) =>
 				case Failure(err) => {
 					log.error("Read failed with: " + err.getMessage)
 					self ! Status.Failure(err)
@@ -187,25 +246,31 @@ class StepOutputPipe(consumers: Map[String, ActorRef], output: String,
 		case StartReading => read()
 
 		/*
+		 * Data read - now we publish the data that has been received and refill the buffer queue if it's not the
+		 * end-of-file.  Note that the thread reading data keeps reading so long as there as there are entries
+		 * in the buffer queue.
+		 *
+		 * data: DataBuffer containing data read
+		 * eof: true if end-of-file reached
+		 */
+		case ReadData(data, eof) => {
+			doReport(0)
+			if (eof) emptyBufferQueue(dataQueue) else if (pause <= 0) fillBufferQueue(dataQueue)
+			processData(data, eof)
+		}
+
+		/*
 		 * Data read - now we publish the data that has been received and start a new thread to read more data if it's
 		 * not the end-of-file.
 		 *
 		 * data: DataBuffer containing data read
 		 * eof: true if end-of-file reached
 		 */
-		case ReadData(data, eof) => {
-			if (data.position > 0 || eof) {
-				if (data.position > 0) {
-					if (debugEnabled)
-						log.debug("Publishing " + data.position + " bytes of data for " + output)
-					dataQueue.publishData(data, eof)
-				} else {
-					log.info("Publishing end-of-file for " + output)
-					dataQueue.publishEndOfData()
-				}
-			}
+		case ReadDataNeedBuffer(data, eof) => {
+			doReport(1)
+			processData(data, eof)
 			/* If eof don't do a stop of actor here.  DataQueue will do that once published data is all digested */
-			if (!eof) read()
+			if (eof) emptyBufferQueue(dataQueue) else read()
 		}
 
 		/*
@@ -244,4 +309,12 @@ object StepOutputPipe {
 	 * @param eof end-of-file reached
 	 */
 	case class ReadData(data: ByteBuffer, eof: Boolean)
+
+	/**
+	 * Message to declare that a read has completed on the pipe
+	 *
+	 * @param data buffer containing data read
+	 * @param eof end-of-file reached
+	 */
+	case class ReadDataNeedBuffer(data: ByteBuffer, eof: Boolean)
 }

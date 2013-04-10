@@ -29,20 +29,20 @@ package org.broadinstitute.PEMstr.common.util
  * Date: 1/21/13
  * Time: 11:56 AM
  *
- * Trait to report on buffers used - just filling in abstract data needed by ReportUpdates.
+ * Class to report on buffers used - just filling in abstract data needed by ReportUpdates.
  */
-trait ReportBuffers extends ReportUpdates {
+class ReportBuffers extends ReportUpdates {
 
 	/**
 	 * How often we want to issue a report
  	 */
-	protected val reportDif = BigInt(10000)
+	final protected val reportDif = BigInt(10000)
 	/**
 	 * What we're reporting on
 	 */
-	protected val reportType = "buffer"
+	final protected val reportType = "buffer"
 	/**
 	 * When the next report should take place
 	 */
-	protected var nextReport = reportDif
+	final protected var nextReport = reportDif
 }

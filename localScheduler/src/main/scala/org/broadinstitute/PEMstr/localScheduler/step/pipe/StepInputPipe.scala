@@ -39,8 +39,13 @@ import java.nio.ByteBuffer
  * @param pipeSpec file specification for pipe
  * @param logger where to log messages
  */
-class StepInputPipe(pipeSpec: String, logger: LoggingAdapter) extends ReportBytes {
+class StepInputPipe(pipeSpec: String, logger: LoggingAdapter) {
 	private val outputFile = new FileOutputStreamTracker
+
+	/**
+	 * Reporter for # of bytes used
+ 	 */
+	private val reportBytes = new ReportBytes
 
 	/**
 	 * Connect to the pipe - this will block until the pipe is open so it's best to call it in a separate thread
@@ -62,7 +67,7 @@ class StepInputPipe(pipeSpec: String, logger: LoggingAdapter) extends ReportByte
 	 */
 	def write(data: Array[ByteBuffer]) = {
 		val outputSize = outputFile.write(data)
-		val nextReport = dataReport("Pipe wrote out ", outputSize, "write")
+		val nextReport = reportBytes.dataReport("Pipe wrote out ", outputSize, "write")
 		if (nextReport.isDefined) logger.info(nextReport.get)
 		outputSize
 	}
@@ -72,7 +77,7 @@ class StepInputPipe(pipeSpec: String, logger: LoggingAdapter) extends ReportByte
 	 */
 	def closePipe() {
 		logger.info("Closing pipe")
-		logger.info(getCurrentReport("Pipe wrote out total of ", "write"))
+		logger.info(reportBytes.getCurrentReport("Pipe wrote out total of ", "write"))
 		outputFile.close()
 	}
 

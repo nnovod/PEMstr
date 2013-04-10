@@ -63,7 +63,12 @@ import org.broadinstitute.PEMstr.common.workflow.WorkflowDefinitions.BufferSetti
  */
 sealed abstract class DataQueueCore(producer: ActorRef, consumerActors: Map[String, ActorRef], system: ActorSystem,
                                     bufferUsage: BufferSettings)
-	extends ReportBuffers with SimpleCounter {
+	extends SimpleCounter {
+
+	/**
+	 * Reporter for buffer usage
+ 	 */
+	private val bufReport = new ReportBuffers
 
 	/* @TODO Do something like this to get amount direct IO buffers available?
 	          val c = Class.forName("java.nio.Bits")
@@ -92,7 +97,7 @@ sealed abstract class DataQueueCore(producer: ActorRef, consumerActors: Map[Stri
 	system.log.info("Starting data queue for producer " + producerPath +
 	  " and consumer(s) " + consumerActors.keys.mkString(", ") + " with buffer size = " + bufferSize +
 	  ", free queue size = " + keepFree + ", fill % = " + bufferUsage.getFillPct +
-	  ", pause = " + bufferUsage.getPauseSize)
+	  ", pause = " + bufferUsage.getPauseSize + ", multi buffering level = " + bufferUsage.getMultiLvl)
 
 	/**
 	 * Consumers list
@@ -163,7 +168,7 @@ sealed abstract class DataQueueCore(producer: ActorRef, consumerActors: Map[Stri
 
 		/* Method to maintain and periodically report on # of buffers allocated */
 		def doReport(i: Int) {
-			val report = dataReport(getReportIntro(""), i)
+			val report = bufReport.dataReport(getReportIntro(""), i)
 			if (report.isDefined) system.log.info(report.get)
 		}
 
@@ -294,7 +299,7 @@ sealed abstract class DataQueueCore(producer: ActorRef, consumerActors: Map[Stri
 				system.scheduler.scheduleOnce(500 milliseconds) {
 					doGC()
 					if (consumers.forall(!_.isInTransition)) {
-						system.log.info(getCurrentReport(getReportIntro("a total of ")))
+						system.log.info(bufReport.getCurrentReport(getReportIntro("a total of ")))
 						if (directAllocationFailures > 0) {
 							system.log.warning(
 								"Direct buffer allocation failures: " + directAllocationFailures.toString)

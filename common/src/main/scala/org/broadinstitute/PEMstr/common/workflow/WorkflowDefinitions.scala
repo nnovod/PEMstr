@@ -258,15 +258,22 @@ object WorkflowDefinitions {
 	private val bufferDefaultPause = 150
 
 	/**
+	 * Default level of multi buffering
+	 */
+	private val bufferDefaultMultiLvl = 2
+
+	/**
 	 * Buffer settings for transmitting data over streams.
 	 *
  	 * @param size byte size of buffers
 	 * @param cache maximum # of buffers to keep cached for reuse (above this # is freed back to system pool)
 	 * @param fillPct Minimum % to fill buffer before transmitting buffer
 	 * @param pause max # of buffers to hold pending before trying to pause the stream source
+	 * @param multiLevel # of buffers to use for multi buffering
 	 */
 	case class BufferSettings(private val size: Option[Int], private val cache: Option[Int],
-	                          private val fillPct: Option[Int], private val pause: Option[Int]) {
+	                          private val fillPct: Option[Int], private val pause: Option[Int],
+	                          private val multiLevel: Option[Int]) {
 		/**
 		 * Get byte size to use for buffers.
 		 *
@@ -287,6 +294,13 @@ object WorkflowDefinitions {
 		 * @return minimum percentage to fill buffer before transmitting it
 		 */
 		def getFillPct = fillPct.getOrElse(bufferDefaultFillPct)
+
+		/**
+		 * Get # of buffers to use for multi buffering
+		 *
+		 * @return # of buffers to use for multi buffering
+		 */
+		def getMultiLvl = multiLevel.getOrElse(bufferDefaultMultiLvl)
 
 		/**
 		 * Is buffer filled to wanted level?

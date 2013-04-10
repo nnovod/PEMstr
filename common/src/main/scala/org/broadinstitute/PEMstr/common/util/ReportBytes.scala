@@ -30,9 +30,9 @@ package org.broadinstitute.PEMstr.common.util
  * Time: 5:06 PM
  */
 /**
- * Simple little trait to report on bytes used.
+ * Simple little class to report on bytes used.
  */
-trait ReportBytes extends ReportUpdates {
+class ReportBytes extends ReportUpdates {
 
 	/**
 	 * How often we want to issue a report

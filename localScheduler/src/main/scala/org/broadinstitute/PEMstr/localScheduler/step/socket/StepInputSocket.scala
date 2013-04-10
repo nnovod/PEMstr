@@ -29,10 +29,9 @@ import java.nio.channels.{SocketChannel, ServerSocketChannel}
 import java.nio.ByteBuffer
 import scala.concurrent.Future
 import util.{Failure, Success}
-import org.broadinstitute.PEMstr.localScheduler.util.dataQueue.
-{PendingDataQueue, DataQueueLinkedConsumer}
+import org.broadinstitute.PEMstr.localScheduler.util.dataQueue.{ByteBufferBufferingQueue,PendingDataQueue,DataQueueLinkedConsumer}
 import org.broadinstitute.PEMstr.common.workflow.RewindPipe
-import org.broadinstitute.PEMstr.common.util.{ValueTracker,StartTracker}
+import org.broadinstitute.PEMstr.common.util.{ReportBuffers,ValueTracker,StartTracker}
 import org.broadinstitute.PEMstr.localScheduler.step.socket.StepInputSocket.
 {SocketListening,FirstSocketData}
 import org.broadinstitute.PEMstr.localScheduler.step.StepManager.{ResumeSource,PauseSource}
@@ -41,7 +40,6 @@ import org.broadinstitute.PEMstr.localScheduler.step.pipe.StepInputPipe
 import org.broadinstitute.PEMstr.localScheduler.LocalScheduler.futureExecutor
 import annotation.tailrec
 import org.broadinstitute.PEMstr.common.workflow.WorkflowDefinitions.BufferSettings
-
 
 /**
  * @author Nathaniel Novod
@@ -59,7 +57,17 @@ import org.broadinstitute.PEMstr.common.workflow.WorkflowDefinitions.BufferSetti
  */
 sealed class StepInputSocket(flow: String, serverChannel: ServerSocketChannel, stepManager: ActorRef,
                              bus: SocketDataEventBus, pipeSpec: String, buffering: BufferSettings)
-	extends Actor with ActorLogging with PendingDataQueue {
+	extends Actor with ActorLogging with PendingDataQueue with ByteBufferBufferingQueue {
+
+	/**
+	 * Reporter for multi buffering usage
+ 	 */
+	private val bufReport = new ReportBuffers
+
+	/**
+	 * Set level for multi buffering
+ 	 */
+	final override protected val bufferingLevel = buffering.getMultiLvl
 
 	/**
 	 * Get step input instance
@@ -75,7 +83,7 @@ sealed class StepInputSocket(flow: String, serverChannel: ServerSocketChannel, s
 	/*
 	 * Data queue used to track data in use by us
 	 */
-	private val queue = new DataQueueLinkedConsumer(self, this.context.system, buffering) {
+	private val dataQueue = new DataQueueLinkedConsumer(self, this.context.system, buffering) {
 		/**
 		 * Called when data is published - we simply add the data to the DataHoldingQueue
 		 *
@@ -178,6 +186,27 @@ sealed class StepInputSocket(flow: String, serverChannel: ServerSocketChannel, s
 	}
 
 	/**
+	 * Get introduction for report of queue usage: "Buffering for (actir) refilled (intro)"
+	 *
+ 	 * @param intro end of intro string
+	 *
+	 * @return beginning of report
+	 */
+	private def getReportIntro(intro: String) = {
+		"Buffering for " + self.path.name + " refilled " + intro
+	}
+
+	/**
+	 * Method to maintain and periodically report on # of times buffers queue had to be refilled
+	 *
+	 * @param i # of items to
+	 */
+	private def doReport(i: Int) {
+		val report = bufReport.dataReport(getReportIntro(""), i)
+		if (report.isDefined) log.info(report.get)
+	}
+
+	/**
 	 * Go read incoming data from the source.
 	 *
  	 * @param client socket used to read data
@@ -198,14 +227,23 @@ sealed class StepInputSocket(flow: String, serverChannel: ServerSocketChannel, s
 			if (read == -1 || buffering.isFilled(data)) (data, read == -1) else readFullBuf(socket, data)
 		}
 
-		val buf = queue.getBuffer
+		fillBufferQueue(dataQueue)
+		/**
+		 * Use a future to read the data but don't mess with the data queue outside actor thread.
+		 */
 		Future {
-			readFullBuf(client, buf)
+			useQueue((buf, bufsLeft) => {
+				val (data, eof) = readFullBuf(client, buf)
+				val bufsToGo = bufsLeft
+				if (bufsToGo > 0) {
+					self ! DataRead(client, data, eof)
+				} else {
+					self ! DataReadNeedBuffer(client, data, eof)
+				}
+				!eof && bufsToGo != 0
+			})
 		} onComplete {
-			case Success(completionData) => {
-				val (data, eof) = completionData
-				self ! DataRead(client, data, eof)
-			}
+			case Success(completionData) =>
 			case Failure(err) => {
 				log.error("Read failed with: " + err.getMessage)
 				self ! Status.Failure(err)
@@ -268,6 +306,38 @@ sealed class StepInputSocket(flow: String, serverChannel: ServerSocketChannel, s
 		true
 	}
 
+
+	def processData(client: SocketChannel, buf: ByteBuffer, eof: Boolean) {
+		val bytesRead = buf.position()
+
+		/* If the first data read then we publish this and go ready the pipe to write out the data */
+		if (!firstTime.isSet) {
+			firstTime.set()
+			bus.publish(FirstSocketData(bytesRead))
+			openPipe(getInputFile, client)
+		}
+
+		/* Put the data on the transition queue */
+		if (bytesRead > 0) {
+			dataQueue.publishData(buf, eof)
+		} else {
+			dataQueue.freeUnusedBuffer(buf)
+			if (eof) {
+				dataQueue.publishEndOfData()
+			}
+		}
+
+		/* Send data out on pipe */
+		sendOutData()
+
+		/* If end-of-data shut down the socket */
+		if (eof) {
+			log.info(bufReport.getCurrentReport(getReportIntro("a total of ")))
+			log.info("Closing client connection")
+			client.close()
+		}
+	}
+
 	/**
 	 * Go finish up the rewind - here to be overriden for rewind sockets
  	 */
@@ -310,6 +380,15 @@ sealed class StepInputSocket(flow: String, serverChannel: ServerSocketChannel, s
 	 * @param eof true if this is end-of-data
 	 */
 	protected case class DataRead(client: SocketChannel, buf: ByteBuffer, eof: Boolean)
+
+	/**
+	 * Message sent when a read on the input socket has completed and more buffers are needed to read more
+	 *
+	 * @param client socket data read from
+	 * @param buf contains data read
+	 * @param eof true if this is end-of-data
+	 */
+	protected case class DataReadNeedBuffer(client: SocketChannel, buf: ByteBuffer, eof: Boolean)
 
 	/**
 	 * Message sent when file (pipe) open completed
@@ -355,35 +434,24 @@ sealed class StepInputSocket(flow: String, serverChannel: ServerSocketChannel, s
 		 * eof: true if end-of-data read
 		 */
 		case DataRead(client, buf, eof) => {
-			val bytesRead = buf.position()
+			doReport(0)
+			if (eof) emptyBufferQueue(dataQueue) else fillBufferQueue(dataQueue)
+			processData(client, buf, eof)
+		}
 
-			/* If the first data read then we publish this and go ready the pipe to write out the data */
-			if (!firstTime.isSet) {
-				firstTime.set()
-				bus.publish(FirstSocketData(bytesRead))
-				openPipe(getInputFile, client)
-			}
+		/*
+		 * Data read from client and reading stopped because more buffers are needed.
+		 *
+		 * client: SocketChannel used for connection
+		 * buf: ByteBuffer with data read
+		 * eof: true if end-of-data read
+		 */
+		case DataReadNeedBuffer(client, buf, eof) => {
+			doReport(0)
+			processData(client, buf, eof)
 
-			/* Put the data on the transition queue */
-			if (bytesRead > 0) {
-				queue.publishData(buf, eof)
-			} else {
-				queue.freeUnusedBuffer(buf)
-				if (eof) {
-					queue.publishEndOfData()
-				}
-			}
-
-			/* Send data out on pipe */
-			sendOutData()
-
-			/* If not the end-of-data go get more, otherwise shut down the socket */
-			if (!eof) {
-				readData(client)
-			} else {
-				log.info("Closing client connection")
-				client.close()
-			}
+			/* If not the end-of-data go get more */
+			if (!eof) readData(client)
 		}
 
 		/*

@@ -48,7 +48,12 @@ import java.nio.ByteBuffer
  * @param port server socket port #
  */
 class StepOutputSocket(host: String,  port: Int)
-  extends Actor with ActorLogging with ReportBytes with PendingDataQueue {
+  extends Actor with ActorLogging with PendingDataQueue {
+
+	/**
+	 * Reporter for # of bytes used
+ 	 */
+	private val reportBytes = new ReportBytes
 
 	/* channel used to connect to server */
 	private val clientChannel = SocketChannel.open()
@@ -82,7 +87,7 @@ class StepOutputSocket(host: String,  port: Int)
 	 */
 	override def postStop() {
 		log.info("postStop")
-		log.info(getCurrentReport("Socket wrote total of "))
+		log.info(reportBytes.getCurrentReport("Socket wrote total of "))
 		if (outputSocket.isSet && outputSocket().isConnected) {
 			log.info("Closing socket")
 			outputSocket().close()
@@ -128,7 +133,7 @@ class StepOutputSocket(host: String,  port: Int)
 			}
 
 			writeData(pendingDataAsByteBufferArray, dataToWrite)
-			val nextReport = dataReport("Socket wrote ", dataToWrite)
+			val nextReport = reportBytes.dataReport("Socket wrote ", dataToWrite)
 			if (nextReport.isDefined) log.info(nextReport.get)
 			clearPendingData()
 			if (eod) {

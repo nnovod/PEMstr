@@ -107,7 +107,7 @@ class WorkflowXML (workflowXML: Elem) {
 	 * @return buffer settings
 	 */
 	private def getBufferSettings(stream: Node,
-	                              defaultBufferSettings: BufferSettings= BufferSettings(None, None, None, None)) = {
+	                              defaultBufferSettings: BufferSettings= BufferSettings(None, None, None, None, None)) = {
 		def bufferInt(options: Node, tag: String, min: Int) =
 			getXMLTag(options, tag) match {
 				case Some(i) => {
@@ -124,7 +124,8 @@ class WorkflowXML (workflowXML: Elem) {
 					bufferInt(bufferOptions, "@size", 512),
 					bufferInt(bufferOptions, "@cache", 1),
 					bufferInt(bufferOptions, "@fillPct", 0),
-					bufferInt(bufferOptions, "@pause", 2))
+					bufferInt(bufferOptions, "@pause", 2),
+					bufferInt(bufferOptions, "@multiLvl", 1))
 			}
 			case None => defaultBufferSettings
 		}
@@ -380,6 +381,7 @@ class WorkflowXML (workflowXML: Elem) {
 				cache={bufferOptions.getCacheSize.toString}
 				fillPct={bufferOptions.getFillPct.toString}
 				pause={bufferOptions.getPauseSize.toString}
+				multiLvl={bufferOptions.getMultiLvl.toString}
 				/>
 			}
 		}
