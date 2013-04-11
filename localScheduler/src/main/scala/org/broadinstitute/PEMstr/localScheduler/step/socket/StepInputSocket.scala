@@ -447,7 +447,7 @@ sealed class StepInputSocket(flow: String, serverChannel: ServerSocketChannel, s
 		 * eof: true if end-of-data read
 		 */
 		case DataReadNeedBuffer(client, buf, eof) => {
-			doReport(0)
+			doReport(1)
 			processData(client, buf, eof)
 
 			/* If not the end-of-data go get more */
