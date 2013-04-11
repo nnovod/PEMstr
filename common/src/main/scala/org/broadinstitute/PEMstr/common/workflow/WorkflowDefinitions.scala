@@ -323,7 +323,8 @@ object WorkflowDefinitions {
 		 *
  		 * @return true if one or more of the parameters specified
 		 */
-		def isSpecified = size.isDefined || cache.isDefined || fillPct.isDefined || pause.isDefined
+		def isSpecified = size.isDefined || cache.isDefined || fillPct.isDefined ||
+			pause.isDefined || multiLevel.isDefined
 
 		/**
 		 * Get max # of buffers to have pending before asking source to pause.
