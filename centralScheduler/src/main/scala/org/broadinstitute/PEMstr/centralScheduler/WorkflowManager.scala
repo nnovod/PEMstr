@@ -410,8 +410,6 @@ class WorkflowManager(workflow: WorkflowDefinition, timeID: Long,
 			}
 		}
 
-		//@TODO Need way for steps to abort during setup to lead to abort of workflow
-
 		/*
 		 * Inputs are setup for a step.  If all the steps have completed setup of inputs then go ask for outputs to
 		 * be setup next.

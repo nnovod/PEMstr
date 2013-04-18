@@ -407,6 +407,8 @@ class StepManager extends ActorWithContext {
 		} else {
 			/* File doesn't exists - just make sure the directory exists */
 			val fileD = fileF.getParentFile
+			if (fileD == null) throw new FileNotFoundException("Error creating named pipe \"" + fileSpec +
+				"\": invalid filename or parent directory")
 			if (!fileD.exists()) fileD.mkdirs()
 		}
 		/* Go create the pipe - no way to do this except to fork off a unix command */
@@ -740,6 +742,9 @@ class StepManager extends ActorWithContext {
 			})
 			/* Respond that we're happily taking on the step */
 			replyTo ! TakingStep(name, wfID, inputPorts)
+			/* Save who to send message to when we're done */
+			locals.actorToTrackWorkflowStatus() = replyTo
+			/* Save who gave us the step (local scheduler) */
 			locals.actorWhoGaveUsStep() = sender
 		}
 
@@ -749,73 +754,83 @@ class StepManager extends ActorWithContext {
 		 * inputs: map of connection information for each input (either port or pipe to use)
 		 */
 		case SetupInputs(inputs: Map[String, DataFlow]) => {
-			/* Get saved step settings */
-			val stepSettings = locals.stepParams()
-			/*
-			 * Input is of two types:
-			 * - socket input that we receive from another step via a socket and then pipe into our step
-			 * - piped input that we receive directly from an output pipe from a previous step
-			 *
-			 * For piped input we don't do anything except create the pipe since the data is going directly between
-			 * the executing steps' processes via the pipe.  This is most efficient, however not always possible.
-			 * In particular, if the two steps are executing on different nodes or the input being received is being
-			 * sent by the previous step to multiple destinations then sockets must be used.
-			 *
-			 * For each socket input we setup a bus that can be subscribed to to know about events on the socket.  Each
-			 * input subscribes to the bus in order to know when any data is received so that we know when to start
-			 * executing the process associated with the step.  We could start the process now but it might just hang
-			 * around doing nothing if input data doesn't arrive soon.
-			 *
-			 * For each socket input we also setup new actors to handle the socket and pipe associated with the input.
-			 * The socket actor (see StepInputSocket) receives messages when socket activity occurs and passes the
-			 * information onto subscribers (e.g., the input pipe).
-			 *
-			 */
-			for (input <- inputs)  {
-				val (iName, iData) = input
-				/* Save the DataFlow associated with the input */
-				locals.inputData()(iName).connection() = iData
-				iData match {
-					/*
-					 * Input is being received over a socket  - do all the initial setup to get the socket ready
-					 * to receive data and the pipe actor ready to get data from the socket to send it to the input
-					 * pipe setup to the step.
-					 */
-					case DataFlowSocket(flow, socket, sourceActor) => {
-						val bus = new SocketDataEventBus
-						bus.subscribe(self, classOf[FirstSocketData])
-						bus.subscribe(self, classOf[SocketListening])
-						val inputPipeSpec = getInputName(stepSettings.stepName, flow, stepSettings.tempDir)
-						mkfifo(inputPipeSpec)
-						//@TODO Someday have max # of pending buffers be configurable (by socket)
-						def getInputSocket = {
-							val inputData = findInputData(socket.port).get
-							val server = inputData.socket
-							val inputDef = stepSettings.stepDef.inputs(iName).stream
-							inputDef.rewind match {
-								case Some(rewindSpec) =>
-									new StepInputSocketRewind(flow, server, self, bus, rewindSpec,
+			try {
+				/* Get saved step settings */
+				val stepSettings = locals.stepParams()
+				/**
+				 * Input is of two types:
+				 * - socket input that we receive from another step via a socket and then pipe into our step
+				 * - piped input that we receive directly from an output pipe from a previous step
+				 *
+				 * For piped input we don't do anything except create the pipe since the data is going directly between
+				 * the executing steps' processes via the pipe.  This is most efficient, however not always possible.
+				 * In particular, if the two steps are executing on different nodes or the input being received is being
+				 * sent by the previous step to multiple destinations then sockets must be used.
+				 *
+				 * For each socket input we setup a bus that can be subscribed to to know about events on the socket.
+				 * Each input subscribes to the bus in order to know when any data is received so that we know when to
+				 * start executing the process associated with the step.  We could start the process now but it might
+				 * just hang around doing nothing if input data doesn't arrive soon.
+				 *
+				 * For each socket input we also setup new actors to handle the socket and pipe associated with the
+				 * input.  The socket actor (see StepInputSocket) receives messages when socket activity occurs and
+				 * passes the information onto subscribers (e.g., the input pipe).
+				 *
+				 */
+				for (input <- inputs)  {
+					val (iName, iData) = input
+					/* Save the DataFlow associated with the input */
+					locals.inputData()(iName).connection() = iData
+					iData match {
+						/**
+						 * Input is being received over a socket  - do all the initial setup to get the socket ready
+						 * to receive data and the pipe actor ready to get data from the socket to send it to the input
+						 * pipe setup to the step.
+						 */
+						case DataFlowSocket(flow, socket, sourceActor) => {
+							val bus = new SocketDataEventBus
+							bus.subscribe(self, classOf[FirstSocketData])
+							bus.subscribe(self, classOf[SocketListening])
+							val inputPipeSpec = getInputName(stepSettings.stepName, flow, stepSettings.tempDir)
+							mkfifo(inputPipeSpec)
+							def getInputSocket = {
+								val inputData = findInputData(socket.port).get
+								val server = inputData.socket
+								val inputDef = stepSettings.stepDef.inputs(iName).stream
+								inputDef.rewind match {
+									case Some(rewindSpec) =>
+										new StepInputSocketRewind(flow, server, self, bus, rewindSpec,
+											inputPipeSpec, inputDef.bufferOptions)
+									case _ => new StepInputSocket(flow, server, self, bus,
 										inputPipeSpec, inputDef.bufferOptions)
-								case _ => new StepInputSocket(flow, server, self, bus,
-									inputPipeSpec, inputDef.bufferOptions)
+								}
 							}
+							val inputActor = context.actorOf(Props(getInputSocket),
+								name = "inputSocket_" + flow + "_" + socket.port)
+							context.watch(inputActor)
 						}
-						val inputActor = context.actorOf(Props(getInputSocket),
-							name = "inputSocket_" + flow + "_" + socket.port)
-						context.watch(inputActor)
-					}
-					/* Input is received directly over a pipe - just make the pipe and close unused socket */
-					case DataFlowPipe(_, pipe) => {
-						mkfifo(pipe)
-						locals.inputData()(iName).socket.close()
+						/* Input is received directly over a pipe - just make the pipe and close unused socket */
+						case DataFlowPipe(_, pipe) => {
+							mkfifo(pipe)
+							locals.inputData()(iName).socket.close()
+						}
 					}
 				}
-			}
 
-			/* Save who to send message to when we're all setup (input sockets are ready) */
-			locals.actorToReplyToWhenSetup() = sender
-			/* Check if we can send out the setup message now */
-			if (isEveryoneListening) sender ! InputsAreSetup(stepSettings.stepName)
+				/* Save who to send message to when we're all setup (input sockets are ready) */
+				locals.actorToReplyToWhenSetup() = sender
+				/* Check if we can send out the setup message now */
+				if (isEveryoneListening) sender ! InputsAreSetup(stepSettings.stepName)
+			} catch {
+				case fnf: FileNotFoundException => {
+					log.error("Input setup failed: " + fnf.getMessage)
+					self ! AbortStep
+				}
+				case e: Exception => {
+					log.error("Input setup failed: " + e.getMessage + "\n" + e.getStackTraceString)
+					self ! AbortStep
+				}
+			}
 		}
 
 		/*
@@ -836,55 +851,67 @@ class StepManager extends ActorWithContext {
 		 * outputs: map of connection information for each output (either array of ports or single pipe)
 		 */
 		case myOutputs @ SetupOutputs(outputs: Map[String, Array[DataFlow]]) => {
-			/* Get saved step settings */
-			val stepSettings = locals.stepParams()
-			/* Save connection info */
-			locals.outputData() = myOutputs.outputs.map((entry) => {
-				val (name, outputs) = entry
-				name -> OutputData(outputs, new ValueTracker[ActorRef])
-			})
-			/*
-			 * Go through the outputs.  For each output that is not being directly piped to the next step we
-			 * create the pipe we'll use to receive output from our step and then setup sockets that will be used
-			 * to send the data on to the steps receiving the output from our step.
- 			 */
-			for (output <- outputs.values if (output.exists(!_.isPipe))) {
-				val outputName = output(0).flow
-				/* Get name we'll use for pipe  and create the pipe */
-				val outputFileName = getOutputName(stepSettings, stepSettings.stepName,
-					outputName, stepSettings.tempDir)
-				mkfifo(outputFileName)
-				/*
-				 * The output is directed to one or more inputs of other steps - here we go through and setup
-				 * an actor to handle each output socket that will send data out to other steps' input.
+			try {
+				/* Get saved step settings */
+				val stepSettings = locals.stepParams()
+				/* Save connection info */
+				locals.outputData() = myOutputs.outputs.map((entry) => {
+					val (name, outputs) = entry
+					name -> OutputData(outputs, new ValueTracker[ActorRef])
+				})
+				/**
+				 * Go through the outputs.  For each output that is not being directly piped to the next step we
+				 * create the pipe we'll use to receive output from our step and then setup sockets that will be used
+				 * to send the data on to the steps receiving the output from our step.
 				 */
-				val sockets = for (flowIndex <- output.indices) yield {
-					assert(output(flowIndex).isInstanceOf[DataFlowSocket], "Non-piped output is not socket")
-					val dataFlow = output(flowIndex).asInstanceOf[DataFlowSocket]
-					val socket = dataFlow.socket
-					/*
-					 * Create an actor to send the data over a socket to the following step.  The actor
-					 * subscribes to the output pipe bus to know when data is to be sent over the socket.
+				for (output <- outputs.values if (output.exists(!_.isPipe))) {
+					val outputName = output(0).flow
+					/* Get name we'll use for pipe  and create the pipe */
+					val outputFileName = getOutputName(stepSettings, stepSettings.stepName,
+						outputName, stepSettings.tempDir)
+					mkfifo(outputFileName)
+					/**
+					 * The output is directed to one or more inputs of other steps - here we go through and setup
+					 * an actor to handle each output socket that will send data out to other steps' input.
 					 */
-					val socketName = "outputSocket_" + outputName + "_" + flowIndex
-					val actor = context.actorOf(Props(
-						new StepOutputSocket(socket.host, socket.port)), name = socketName)
-					context.watch(actor)
-					/* yield is building up map of socket names to actor references for the socket */
-					socketName -> actor
+					val sockets = for (flowIndex <- output.indices) yield {
+						assert(output(flowIndex).isInstanceOf[DataFlowSocket], "Non-piped output is not socket")
+						val dataFlow = output(flowIndex).asInstanceOf[DataFlowSocket]
+						val socket = dataFlow.socket
+						/**
+						 * Create an actor to send the data over a socket to the following step.  The actor
+						 * subscribes to the output pipe bus to know when data is to be sent over the socket.
+						 */
+						val socketName = "outputSocket_" + outputName + "_" + flowIndex
+						val actor = context.actorOf(Props(
+							new StepOutputSocket(socket.host, socket.port)), name = socketName)
+						context.watch(actor)
+						/* yield is building up map of socket names to actor references for the socket */
+						socketName -> actor
+					}
+					/* Add checkpoint, if specified, as an additional consumer */
+					val consumers = addCheckpoint(stepSettings, outputName, sockets)
+					/* Setup the pipe actor to read data coming from the process and send it out to the sockets */
+					val bufferOptions = stepSettings.stepDef.outputs(outputName).bufferOptions
+					val outputPipeActor =
+						context.actorOf(Props(new StepOutputPipe(consumers.toMap, outputFileName, bufferOptions)),
+							name = "output_" + outputName)
+					context.watch(outputPipeActor)
+					locals.outputData()(outputName).pipeActor() = outputPipeActor
 				}
-				/* Add checkpoint, if specified, as an additional consumer */
-				val consumers = addCheckpoint(stepSettings, outputName, sockets)
-				/* Setup the pipe actor to read data coming from the process and send it out to the sockets */
-				val bufferOptions = stepSettings.stepDef.outputs(outputName).bufferOptions
-				val outputPipeActor =
-					context.actorOf(Props(new StepOutputPipe(consumers.toMap, outputFileName, bufferOptions)),
-						name = "output_" + outputName)
-				context.watch(outputPipeActor)
-				locals.outputData()(outputName).pipeActor() = outputPipeActor
+				sender ! StepSetup(stepSettings.stepName)
+			} catch {
+				case fnf: FileNotFoundException => {
+					log.error("Input setup failed: " + fnf.getMessage)
+					self ! AbortStep
+				}
+				case e: Exception => {
+					log.error("Output setup failed: " + e.getMessage + "\n" + e.getStackTraceString)
+					self ! AbortStep
+				}
 			}
-			sender ! StepSetup(stepSettings.stepName)
 		}
+
 
 		/*
 		 * Time to startup the step process.  We start up the process immediately if one of the following is true:
@@ -897,8 +924,6 @@ class StepManager extends ActorWithContext {
 			log.info("Starting step")
 			if (getInputConnections.exists((inp) => inp.isPipe) ||
 				locals.stepParams().stepDef.inputs.size == 0) runStepProcess()
-			/* Save who to send message to when we're done */
-			locals.actorToTrackWorkflowStatus() = sender
 		}
 
 		/*

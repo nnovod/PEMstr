@@ -27,7 +27,7 @@
     <groupId>org.broadinstitute.PEMstr</groupId>
     <artifactId>PEMstr</artifactId>
     <packaging>pom</packaging>
-    <version>1.01</version>
+    <version>1.10</version>
     <modules>
         <module>common</module>
         <module>submitXML</module>
@@ -98,14 +98,14 @@
             <version>${akka.version}</version>
         </dependency>
 
-        <!-- Test -->
+        <!-- Test
         <dependency>
             <groupId>junit</groupId>
             <artifactId>junit</artifactId>
             <version>4.8.2</version>
             <scope>test</scope>
         </dependency>
-        <dependency>
+         <dependency>
             <groupId>org.specs2</groupId>
             <artifactId>specs2_${scala.modifier.version}</artifactId>
             <version>1.14</version>
@@ -117,6 +117,7 @@
             <version>2.0.M5b</version>
             <scope>test</scope>
         </dependency>
+ -->
     </dependencies>
 
     <build>

@@ -24,7 +24,8 @@
 
 package org.broadinstitute.PEMstr.splitApp
 
-import java.io.{FileWriter,BufferedWriter,BufferedReader,FileReader}
+import java.io.{InputStreamReader,FileInputStream,FileWriter,BufferedWriter,BufferedReader}
+import java.util.zip.InflaterInputStream
 
 /**
  * @author nnovod
@@ -48,10 +49,12 @@ object SplitApp {
 			val writers = outputs.map((f) => new BufferedWriter(new FileWriter(f)))
 			val splitLevel = writers.length
 			for (input <- inputs) {
-				val reader = new BufferedReader(new FileReader(input))
+				val fileInput = new FileInputStream(input)
+				val inputStream = if (input.endsWith(".gz")) new InflaterInputStream(fileInput) else fileInput
+				val reader = new BufferedReader(new InputStreamReader(inputStream))
 				if (splitLevel > 0) {
 
-					def getNextRead() = {
+					def getNextRead = {
 						(for (i <- 1 to 4) yield {
 							val line = reader.readLine()
 							if (line != null) line else ""
@@ -59,13 +62,13 @@ object SplitApp {
 					}
 
 					var nextWriter = 0
-					var nextRead = getNextRead()
+					var nextRead = getNextRead
 					while (nextRead.forall(_.length != 0)) {
 						nextRead.foreach((r) => {
 							writers(nextWriter).write(r)
 							writers(nextWriter).newLine()
 						})
-						nextRead = getNextRead()
+						nextRead = getNextRead
 						nextWriter += 1
 						if (nextWriter == writers.length) nextWriter = 0
 					}

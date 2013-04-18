@@ -3,12 +3,12 @@
     <parent>
         <artifactId>PEMstr</artifactId>
         <groupId>org.broadinstitute.PEMstr</groupId>
-        <version>1.01</version>
+        <version>1.10</version>
     </parent>
     <modelVersion>4.0.0</modelVersion>
     <artifactId>common</artifactId>
     <name>${project.artifactId}</name>
-    <version>${project.parent.version}</version>
+    <version>1.10</version>
     <description>Common Module for Pipeline Execution Manager with Streaming</description>
     <inceptionYear>2012</inceptionYear>
     <packaging>jar</packaging>
