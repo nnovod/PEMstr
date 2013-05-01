@@ -24,7 +24,7 @@
 
 package org.broadinstitute.PEMstr.localScheduler.step
 
-import pipe.StepOutputPipe
+import org.broadinstitute.PEMstr.localScheduler.step.pipe.{StepOutputPipeIgnoreEOF,StepOutputPipe}
 import org.broadinstitute.PEMstr.localScheduler.LocalScheduler
 import LocalScheduler.YourStep
 import org.broadinstitute.PEMstr.localScheduler.step.StepManager.{ResumeSource,PauseSource,ProcessDone}
@@ -893,9 +893,14 @@ class StepManager extends ActorWithContext {
 					val consumers = addCheckpoint(stepSettings, outputName, sockets)
 					/* Setup the pipe actor to read data coming from the process and send it out to the sockets */
 					val bufferOptions = stepSettings.stepDef.outputs(outputName).bufferOptions
-					val outputPipeActor =
-						context.actorOf(Props(new StepOutputPipe(consumers.toMap, outputFileName, bufferOptions)),
-							name = "output_" + outputName)
+					val outputPipeActor = stepSettings.stepDef.outputs(outputName).ignoreEOF match {
+						case Some(iE) =>
+							context.actorOf(Props(new StepOutputPipeIgnoreEOF(
+								consumers.toMap, outputFileName, bufferOptions, iE)), name = "output_" + outputName)
+						case None =>
+							context.actorOf(Props(new StepOutputPipe(consumers.toMap, outputFileName, bufferOptions)),
+								name = "output_" + outputName)
+					}
 					context.watch(outputPipeActor)
 					locals.outputData()(outputName).pipeActor() = outputPipeActor
 				}

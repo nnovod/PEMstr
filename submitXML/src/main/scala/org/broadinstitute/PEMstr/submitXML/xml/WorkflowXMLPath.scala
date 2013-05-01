@@ -222,14 +222,15 @@ trait WorkflowXMLPath {
 	private def drawAllPaths(wf: WorkflowPathStep, indent: Int) : String = {
 		val viaStart = drawVia(wf.flows)
 		val newIndent = indent + viaStart.length()
-		viaStart + drawTo(wf.toStep, wf.isLoop) +
+		val toStep = drawTo(wf.toStep, wf.isLoop)
+		viaStart + toStep +
 			(wf.next match {
-		  case head :: Nil => drawAllPaths(head, newIndent)
-		  /* There's a tail - that means there are alternate paths starting from this node */
-		  case head :: tail => drawAllPaths(head, newIndent) +
-		    drawAllPaths(WorkflowPathStart(wf.toStep, tail), newIndent, first = false)
-		  case _ => ""
-	  })
+				case head :: Nil => drawAllPaths(head, newIndent + toStep.length())
+				/* There's a tail - that means there are alternate paths starting from this node */
+				case head :: tail => drawAllPaths(head, newIndent + toStep.length()) +
+					drawAllPaths(WorkflowPathStart(wf.toStep, tail), newIndent, first = false)
+				case _ => ""
+			})
 	}
 
 	/**

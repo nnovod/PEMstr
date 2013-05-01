@@ -144,7 +144,8 @@ object WorkflowSplitJoin {
 					case sos: SplitOutputStreamFile => {
 						(for (i <- 0 until sos.split.instances.getOrElse(defaultSplitPaths)) yield {
 							val newStream = SplitOutputStreamFile(sos.name, sos.hiddenAs,
-								sos.isNotDirectPipe, sos.checkpointAs, sos.split, sos.bufferOptions, Some(i))
+								sos.isNotDirectPipe, sos.checkpointAs, sos.split, sos.bufferOptions,
+								sos.ignoreEOF, Some(i))
 							newStream.name -> newStream
 						}).toMap
 					}
@@ -167,7 +168,7 @@ object WorkflowSplitJoin {
 							/* Create instance of streams being joined that we are using */
 							val flowInstance = stepInstance.getOrElse(0) % joinPaths
 							val newStream = new OutputStreamFile(os.name, os.hiddenAs, os.isNotDirectPipe,
-								os.checkpointAs, os.bufferOptions, Some(flowInstance))
+								os.checkpointAs, os.bufferOptions, os.ignoreEOF, Some(flowInstance))
 							Map(newStream.name -> newStream)
 						}
 					}
@@ -425,7 +426,7 @@ object WorkflowSplitJoin {
 		 */
 		def getSplitSpec(step: String, flow: String) = {
 			workflow.steps(step).outputs(flow) match {
-				case SplitOutputStreamFile(_, _, _, _, splitSpec, _, _) => Some(splitSpec)
+				case SplitOutputStreamFile(_, _, _, _, splitSpec, _, _, _) => Some(splitSpec)
 				case _ => None
 			}
 		}

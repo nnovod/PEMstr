@@ -181,6 +181,21 @@ class WorkflowXML (workflowXML: Elem) {
 	}
 
 	/**
+	 * Gets optional ignoreEOF specification for output stream.
+	 *
+ 	 * @param flow flow XML node
+	 * @return Optional rewind specification for flow to
+	 */
+	private def getIgnoreEOF(flow: Node) = {
+		getSingleNode(flow, "ignoreEOF") match {
+			case Some(iEOF) => {
+				Some(IgnoreEOF(getXMLint(iEOF \ "@delay"), getXMLboolean(iEOF \ "@reopen")))
+			}
+			case None => None
+		}
+	}
+
+	/**
 	 * Get flow to information for a join
 	 *
 	 * @param streamName name for stream join is for
@@ -206,7 +221,7 @@ class WorkflowXML (workflowXML: Elem) {
 	 */
 	private def getOutputStreamFileData(stream: Node) = {
 		(getNameTag(stream), getXMLstring(stream \ "hiddenAs"), getXMLstring(stream \ "checkpointAs"),
-			getXMLboolean(stream \ "@noDirectPipes").getOrElse(false), getBufferSettings(stream))
+			getXMLboolean(stream \ "@noDirectPipes").getOrElse(false), getBufferSettings(stream), getIgnoreEOF(stream))
 	}
 
 	/**
@@ -270,28 +285,30 @@ class WorkflowXML (workflowXML: Elem) {
 
 	/* Map streams in XML to StreamData structure */
 	private val streams = (workflowXML \ "streams" \ "stream").map(stream => {
-		val (name, hiddenAs, checkpointAs, isNotDirectPipe, bufferSettings) = getOutputStreamFileData(stream)
+		val (name, hiddenAs, checkpointAs, isNotDirectPipe, bufferSettings, ignoreEOF) = getOutputStreamFileData(stream)
 		new StreamData(
 			new OutputStreamFile(
 				outputStreamName = name,
 				hiddenAs = hiddenAs,
 				isNotDirectPipe = isNotDirectPipe,
 				checkpointAs = checkpointAs,
-				bufferOptions = bufferSettings),
+				bufferOptions = bufferSettings,
+				ignoreEOF= ignoreEOF),
 			stepFrom = getMandatoryTag(stream, "@from"),
 			toStreams = getToFlows(name, stream, bufferSettings))
 	})
 
 	/* Map joins in XML to JoinData structure */
 	private val joins = (workflowXML \ "streams" \ "join").map(stream => {
-		val (name, hiddenAs, checkpointAs, isNotDirectPipe, bufferSettings) = getOutputStreamFileData(stream)
+		val (name, hiddenAs, checkpointAs, isNotDirectPipe, bufferSettings, ignoreEOF) = getOutputStreamFileData(stream)
 		JoinData(
 			joinFromStream = new OutputStreamFile(
 				outputStreamName = name,
 				hiddenAs = hiddenAs,
 				isNotDirectPipe = isNotDirectPipe,
 				checkpointAs = checkpointAs,
-				bufferOptions = bufferSettings),
+				bufferOptions = bufferSettings,
+				ignoreEOF = ignoreEOF),
 			fromStep = getMandatoryTag(stream, "@from"),
 			toStream = getJoinToFlow(name, stream, bufferSettings))
 	})
@@ -299,7 +316,7 @@ class WorkflowXML (workflowXML: Elem) {
 	/* Map splits in XML to SplitData structure */
 	private val splits = (workflowXML \ "streams" \ "split").map(stream => {
 		val toFlow = getMandatorySingleNode(stream, "flow")
-		val (name, hiddenAs, checkpointAs, isNotDirectPipe, bufferSettings) = getOutputStreamFileData(stream)
+		val (name, hiddenAs, checkpointAs, isNotDirectPipe, bufferSettings, ignoreEOF) = getOutputStreamFileData(stream)
 		SplitData(
 			splitFromStream = SplitOutputStreamFile(
 				splitStreamName = name,
@@ -307,7 +324,8 @@ class WorkflowXML (workflowXML: Elem) {
 				splitHiddenAs = hiddenAs,
 				splitIsNotDirectPipe = isNotDirectPipe,
 				split = getSplitSpec(stream),
-				splitBufferOptions = bufferSettings),
+				splitBufferOptions = bufferSettings,
+				splitIgnoreEOF = ignoreEOF),
 			fromStep = getMandatoryTag(stream, "@from"),
 			toStream =  getToFlow(getNameTag(stream), toFlow, bufferSettings))
 	})
@@ -365,6 +383,7 @@ class WorkflowXML (workflowXML: Elem) {
 			{if (strm.fromStream.hiddenAs.isDefined)
 				<hiddenAs>{strm.fromStream.hiddenAs.get}</hiddenAs>}
 			{getBuffering(strm.fromStream.bufferOptions)}
+			{outputIgnoreEOF(strm.fromStream.ignoreEOF)}
 		}
 
 		/**
@@ -382,6 +401,22 @@ class WorkflowXML (workflowXML: Elem) {
 				fillPct={bufferOptions.getFillPct.toString}
 				pause={bufferOptions.getPauseSize.toString}
 				multiLvl={bufferOptions.getMultiLvl.toString}
+				/>
+			}
+		}
+
+		/**
+		 * Output XML for ignoreEOF settings
+		 *
+		 * @param ignoreEOF contains ignore EOF settings
+		 *
+		 * @return XML for ignore EOF if specified
+		 */
+		def outputIgnoreEOF(ignoreEOF: Option[IgnoreEOF]) = {
+			{if (ignoreEOF.isDefined)
+				<ignoreEOF
+				delay={ignoreEOF.get.getDelay.toString}
+				reopen={ignoreEOF.get.isReopen.toString}
 				/>
 			}
 		}
@@ -655,6 +690,7 @@ object WorkflowXML {
 	private val flowTags = List(WorkflowTags("hiddenAs", List.empty),
 		WorkflowTags("checkpointAs", List.empty),
 		WorkflowTags("buffering", List.empty),
+		WorkflowTags("ignoreEOF", List.empty),
 		WorkflowTags("flow",
 			List(WorkflowTags("rewind", List.empty),
 				WorkflowTags("buffering", List.empty))))

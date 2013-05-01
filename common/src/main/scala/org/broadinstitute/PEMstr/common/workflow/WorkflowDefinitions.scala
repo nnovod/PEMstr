@@ -126,15 +126,17 @@ object WorkflowDefinitions {
 	 * @param splitCheckpointAs optional file specification to write out file for checkpointing
 	 * @param split specification to split output into multiple flows
 	 * @param splitBufferOptions settings for buffering to do for stream
+	 * @param splitIgnoreEOF optional settings if initial EOF is to be ignored
 	 * @param splitStreamInstance optional instance #
 	 */
 	case class SplitOutputStreamFile(private val splitStreamName: String, private val splitHiddenAs: Option[String],
 	                                 private val splitIsNotDirectPipe: Boolean,
 	                                 private val splitCheckpointAs: Option[String], split: SplitSpec,
 	                                 private val splitBufferOptions: BufferSettings,
+	                                 private val splitIgnoreEOF: Option[IgnoreEOF],
 	                                 private val splitStreamInstance: Option[Int] = None)
 	  extends OutputStreamFile(splitStreamName, splitHiddenAs, splitIsNotDirectPipe,
-		  splitCheckpointAs, splitBufferOptions, splitStreamInstance)
+		  splitCheckpointAs, splitBufferOptions, splitIgnoreEOF, splitStreamInstance)
 
 	/**
 	 * Output data file (file being read as output from a step)
@@ -145,11 +147,13 @@ object WorkflowDefinitions {
 	 *                        (sometimes needed to avoid process blocking when opening multiple streams between steps)
 	 * @param checkpointAs optional file specification to write out file for checkpointing
 	 * @param bufferOptions settings for buffering to do for stream
+	 * @param ignoreEOF optional settings if initial EOF is to be ignored
 	 * @param outputStreamInstance optional instance # (for splits)
 	 */
 	class OutputStreamFile(private val outputStreamName: String, val hiddenAs: Option[String],
 	                       val isNotDirectPipe: Boolean, val checkpointAs: Option[String],
-	                       val bufferOptions: BufferSettings, private val outputStreamInstance: Option[Int] = None)
+	                       val bufferOptions: BufferSettings, val ignoreEOF: Option[IgnoreEOF],
+	                       private val outputStreamInstance: Option[Int] = None)
 	  extends ItemInstance(outputStreamName, outputStreamInstance) with Serializable
 
 	/**
@@ -332,6 +336,28 @@ object WorkflowDefinitions {
 		 * @return max # of buffers to have pending before asking source to pause
 		 */
 		def getPauseSize = pause.getOrElse(bufferDefaultPause)
+	}
+
+	/**
+	 * Specification to ignore initial EOF in output stream
+	 *
+	 * @param delay optional # of seconds to delay reopen
+	 * @param reopen true if reopen should be done when EOF is seen
+	 */
+	case class IgnoreEOF(private val delay: Option[Int], private val reopen: Option[Boolean]) {
+		/**
+		 * Get # of seconds to delay between a close and reopen (defaults to 3)
+		 *
+		 * @return # of seconds to delay between a close and reopen
+		 */
+		def getDelay = delay.getOrElse(3)
+
+		/**
+		 * Is a reopen wanted?
+		 *
+		 * @return true if a reopen of the stream is wanted when end-of-file is seen
+		 */
+		def isReopen = reopen.getOrElse(true)
 	}
 
 	/**

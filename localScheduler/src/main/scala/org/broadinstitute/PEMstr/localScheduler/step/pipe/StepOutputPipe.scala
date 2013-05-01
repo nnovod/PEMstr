@@ -35,8 +35,8 @@ import org.broadinstitute.PEMstr.localScheduler.util.dataQueue.{ByteBufferBuffer
 import util.{Failure, Success}
 import org.broadinstitute.PEMstr.localScheduler.LocalScheduler.futureExecutor
 import annotation.tailrec
-import org.broadinstitute.PEMstr.common.workflow.WorkflowDefinitions.BufferSettings
-import org.broadinstitute.PEMstr.common.util.ReportBuffers
+import org.broadinstitute.PEMstr.common.workflow.WorkflowDefinitions.{IgnoreEOF,BufferSettings}
+import org.broadinstitute.PEMstr.common.util.{StartTracker,ReportBuffers}
 
 /**
  * @author Nathaniel Novod
@@ -52,7 +52,7 @@ import org.broadinstitute.PEMstr.common.util.ReportBuffers
  *
  */
 
-class StepOutputPipe(consumers: Map[String, ActorRef], output: String,
+sealed class StepOutputPipe(consumers: Map[String, ActorRef], output: String,
                      buffering: BufferSettings)
 	extends Actor with ActorLogging with ByteBufferBufferingQueue {
 
@@ -74,6 +74,13 @@ class StepOutputPipe(consumers: Map[String, ActorRef], output: String,
 	 * Track the output pipe
 	 */
 	private val inputStream = new FileInputStreamTracker
+
+	/**
+	 * Get the input stream (can be overriden to use different input streams)
+	 *
+	 * @return input stream
+	 */
+	protected def getInputStream = inputStream
 
 	/**
 	 * Queue to send off request to consumers.  Queue does buffer management and terminates producer (us) and
@@ -99,7 +106,7 @@ class StepOutputPipe(consumers: Map[String, ActorRef], output: String,
 	override def preStart() {
 		log.info("preStart for output pipe " + output)
 		Future {
-			inputStream.open(output)
+			getInputStream.open(output)
 		} onComplete {
 			case Success(result) => {
 				startReader()
@@ -113,7 +120,7 @@ class StepOutputPipe(consumers: Map[String, ActorRef], output: String,
  	 */
 	override def postStop() {
 		log.info("postStop")
-		inputStream.close()
+		getInputStream.close()
 	}
 
 	/**
@@ -128,8 +135,10 @@ class StepOutputPipe(consumers: Map[String, ActorRef], output: String,
 	 *
  	 * @param data byte data read
 	 * @param eof true if end-of-file reached
+	 *
+	 * @return eof
 	 */
-	private def processData(data: ByteBuffer, eof: Boolean) {
+	protected def processData(data: ByteBuffer, eof: Boolean) = {
 		if (data.position > 0 || eof) {
 			if (eof) log.info(bufReport.getCurrentReport(getReportIntro("a total of ")))
 			if (data.position > 0) {
@@ -141,6 +150,7 @@ class StepOutputPipe(consumers: Map[String, ActorRef], output: String,
 				dataQueue.publishEndOfData()
 			}
 		}
+		eof
 	}
 
 	/**
@@ -168,7 +178,7 @@ class StepOutputPipe(consumers: Map[String, ActorRef], output: String,
 	 * Method called to read data from the pipe.  When we've read the wanted amount of data we send a message back
 	 * to the actor with the data read.
  	 */
-	private def read() {
+	protected def read() {
 		/**
 		 * Little recursive fellow to read till we either each the end of the file or fill buffer to wanted level.
 		 *
@@ -201,7 +211,7 @@ class StepOutputPipe(consumers: Map[String, ActorRef], output: String,
 			 */
 			Future {
 				useQueue((buf, bufsLeft) => {
-					val (data, eof) = readData(inputStream, buf)
+					val (data, eof) = readData(getInputStream, buf)
 					val bufsToGo = bufsLeft
 					if (bufsToGo > 0) {
 						self ! ReadData(data, eof)
@@ -255,8 +265,9 @@ class StepOutputPipe(consumers: Map[String, ActorRef], output: String,
 		 */
 		case ReadData(data, eof) => {
 			doReport(0)
-			if (eof) emptyBufferQueue(dataQueue) else if (pause <= 0) fillBufferQueue(dataQueue)
-			processData(data, eof)
+			if (!eof && pause <= 0) fillBufferQueue(dataQueue)
+			val done = processData(data, eof)
+			if (done) emptyBufferQueue(dataQueue)
 		}
 
 		/*
@@ -268,9 +279,9 @@ class StepOutputPipe(consumers: Map[String, ActorRef], output: String,
 		 */
 		case ReadDataNeedBuffer(data, eof) => {
 			doReport(1)
-			processData(data, eof)
+			val done = processData(data, eof)
 			/* If eof don't do a stop of actor here.  DataQueue will do that once published data is all digested */
-			if (eof) emptyBufferQueue(dataQueue) else read()
+			if (done) emptyBufferQueue(dataQueue) else read()
 		}
 
 		/*
@@ -279,6 +290,76 @@ class StepOutputPipe(consumers: Map[String, ActorRef], output: String,
 		case e => log.warning("received unknown message: " + e)
 	}
 
+}
+
+/**
+ *
+ * Special output pipe that allows multiple output streams.  When we see the first end-of-file we do not shut down the
+ * stream but simply ignore it and close and reopen the pipe if requested.  This allows steps to stream out "preface"
+ * files to the pipe before the main output arrives.
+ *
+ * @param consumers map of consumers of data containing (consumer_name -> ActorRef for consumer)
+ * @param output Name of output pipe
+ * @param buffering settings for buffering to do for stream
+ * @param ignoreEOF specification for reopen/delay to use when ignoring EOF
+ */
+final class StepOutputPipeIgnoreEOF(consumers: Map[String, ActorRef], output: String,
+                                    buffering: BufferSettings, ignoreEOF: IgnoreEOF)
+	extends StepOutputPipe(consumers, output, buffering) {
+
+	/**
+	 *  Flag to indicate that the reopen has been completed  - we processed one eof and closed and reopened the file
+	 */
+	private val reopenDone = new StartTracker
+
+	/**
+	 * Track the reopened output pipe
+	 */
+	private val reopenInputStream = new FileInputStreamTracker
+
+	/**
+	 * Get original input stream if reopen not done, otherwise get reopen input stream.
+	 *
+ 	 * @return stream currently in use
+	 */
+	override protected def getInputStream =
+		if (reopenDone.isSet && ignoreEOF.isReopen) reopenInputStream else super.getInputStream
+
+	/**
+	 * Process new buffer of data that has been read.  We publish that the data has arrived to interested parties.  If
+	 * an end-of-file is being seen for the first time we publish the data as if there was no eof and if requested
+	 * close and reopen the file to receive new data.
+	 *
+ 	 * @param data byte data read
+	 * @param eof true if end-of-file reached
+	 *
+	 * @return eof
+	 */
+	override protected def processData(data: ByteBuffer, eof: Boolean) = {
+		val endNow = eof && reopenDone.isSet
+		super.processData(data, endNow)
+
+		/**
+		 * If first eof we've seen we close and reopen the file to get more input
+		 */
+		if (eof && !reopenDone.isSet) {
+			log.info("Received eof to be ignored from " + output)
+			if (ignoreEOF.isReopen) {
+				getInputStream.close()
+			}
+			if (ignoreEOF.getDelay != 0) {
+				log.info("Executing delay after eof received from " + output)
+				Thread.sleep(ignoreEOF.getDelay * 1000)
+			}
+			if (ignoreEOF.isReopen) {
+				log.info("Reopening " + output)
+				reopenInputStream.open(output)
+			}
+			reopenDone.set()
+			read()
+		}
+		endNow
+	}
 }
 
 /**

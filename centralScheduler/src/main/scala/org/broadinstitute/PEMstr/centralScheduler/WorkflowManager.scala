@@ -33,6 +33,9 @@ import org.broadinstitute.PEMstr.common.util.Util.getTimeID
 import org.broadinstitute.PEMstr.common.workflow.WorkflowDefinitions._
 import scala.concurrent.duration._
 import org.broadinstitute.PEMstr.common.StepCommandArgTokens.{replaceVariables, getVariableValue}
+import org.broadinstitute.PEMstr.common.ActorWithContext.MutableContext
+import org.broadinstitute.PEMstr.common.ActorWithContext
+import org.broadinstitute.PEMstr.centralScheduler.CentralScheduler.SchedulerAbort
 
 /**
  * @author Nathaniel Novod
@@ -48,7 +51,13 @@ import org.broadinstitute.PEMstr.common.StepCommandArgTokens.{replaceVariables, 
  * @param replyTo actor to tell about workflow status
  */
 class WorkflowManager(workflow: WorkflowDefinition, timeID: Long,
-                      bus: StepExecutionRequestBus, replyTo: ActorRef) extends Actor with ActorLogging {
+                      bus: StepExecutionRequestBus, replyTo: ActorRef) extends ActorWithContext {
+
+	/**
+	 * Broken connection error
+ 	 */
+	val ENOLINK = 0x478
+
 	/**
 	 * Message to say to republish untaken steps
  	 */
@@ -60,12 +69,6 @@ class WorkflowManager(workflow: WorkflowDefinition, timeID: Long,
 	override def preStart() {
 		self ! Publish(0)
 	}
-
-	/* Get workflow specific temporary directory (tempDir with workflow actor name added) */
-	private lazy val wfTempDir = workflow.tmpDir + "/" + self.path.name
-
-	/* Get workflow specific temporary directory (tempDir with workflow actor name added) */
-	private lazy val wfLogDir = workflow.logDir + "/" + self.path.name
 
 	/**
 	 * Tracks the remote actor associated with a step and the sockets being used to send input to the step
@@ -79,43 +82,67 @@ class WorkflowManager(workflow: WorkflowDefinition, timeID: Long,
 	private case class SocketActor(actor: ActorRef, stepName: String, host: String,
 	                               inputPorts: Map[String, InputConnectionInfo])
 
-	/* Get list of step names */
-	private val stepNames = workflow.steps.keys.toList
+	/**
+	 * Actor context - it is saved in instance between invocations of actor and also restored to any new instances
+	 * of the actor that get created due to restarts.
+	 */
+	protected[WorkflowManager] class LocalContext extends MutableContext {
+		/* Get workflow specific temporary directory (tempDir with workflow actor name added) */
+		lazy val wfTempDir = workflow.tmpDir + "/" + self.path.name
 
-	/* Record which steps have been allocated for execution */
-	private val stepsTaken = new ValueMapTracker[String, String](stepNames)
+		/* Get workflow specific temporary directory (tempDir with workflow actor name added) */
+		lazy val wfLogDir = workflow.logDir + "/" + self.path.name
 
-	/* Record actors that are executing steps */
-	private val stepActors = new ValueMapTracker[String, SocketActor](stepNames)
+		/* Get list of step names */
+		val stepNames = workflow.steps.keys.toList
 
-	/* Record which steps have setup inputs */
-	private val stepsInputs = new StartMapTracker(stepNames)
+		/* Record which steps have been allocated for execution */
+		val stepsTaken = new ValueMapTracker[String, String](stepNames)
 
-	/* Record which steps have started executing */
-	private val stepsStarted = new StartMapTracker(stepNames)
+		/* Record actors that are executing steps */
+		val stepActors = new ValueMapTracker[String, SocketActor](stepNames)
 
-	/* Record which steps have completed executing */
-	private val stepsDone = new ValueMapTracker[String, Int](stepNames)
+		/* Record which steps have setup inputs */
+		val stepsInputs = new StartMapTracker(stepNames)
 
-	/* Create a map with output files as key and the set of input files (steps) they feed as values */
-	private lazy val outputMap = {
-		/* Go through the steps to build up the map */
-		workflow.steps.foldLeft(HashMap.empty[DataFilePointer, Set[String]])(
-			(totalMap, stepEntry) => {
-				val (stepName, stepDef) = stepEntry
-				val inputData = stepDef.inputs
-				/* Go through the inputs for this step finding their sources (outputs that feed them) */
-				inputData.foldLeft(totalMap)(
-					(stepMap, inputEntry) => {
-						val (_, inputData) = inputEntry
-						val source = inputData.sourceData
-						stepMap.get(source) match {
-							case Some(soFar) => stepMap + (source -> (soFar + stepName))
-							case None => stepMap + (source -> Set(stepName))
-						}
-					})
-			})
+		/* Record which steps have started executing */
+		val stepsStarted = new StartMapTracker(stepNames)
+
+		/* Record which steps have completed executing */
+		val stepsDone = new ValueMapTracker[String, Int](stepNames)
+
+		/* Create a map with output files as key and the set of input files (steps) they feed as values */
+		lazy val outputMap = {
+			/* Go through the steps to build up the map */
+			workflow.steps.foldLeft(HashMap.empty[DataFilePointer, Set[String]])(
+				(totalMap, stepEntry) => {
+					val (stepName, stepDef) = stepEntry
+					val inputData = stepDef.inputs
+					/* Go through the inputs for this step finding their sources (outputs that feed them) */
+					inputData.foldLeft(totalMap)(
+						(stepMap, inputEntry) => {
+							val (_, inputData) = inputEntry
+							val source = inputData.sourceData
+							stepMap.get(source) match {
+								case Some(soFar) => stepMap + (source -> (soFar + stepName))
+								case None => stepMap + (source -> Set(stepName))
+							}
+						})
+				})
+		}
 	}
+
+	/**
+	 * What our context looks like
+ 	 */
+	override type MyContext = LocalContext
+
+	/**
+	 * Create a new context.
+	 *
+	 * @return new instance of local context
+	 */
+	override protected[WorkflowManager] def getMyContext = new LocalContext
 
 	/**
 	 * Create a dataflow containing information for how data will go between two steps.  The returned object
@@ -138,7 +165,7 @@ class WorkflowManager(workflow: WorkflowDefinition, timeID: Long,
 		 * @return number of inputs to receive output
 		 */
 		def inputSizeForOutput(outputSource: DataFilePointer) =
-			outputMap.get(outputSource) match {
+			locals.outputMap.get(outputSource) match {
 				case Some(inputs) => inputs.size
 				case None => 0
 			}
@@ -150,7 +177,7 @@ class WorkflowManager(workflow: WorkflowDefinition, timeID: Long,
 		 *
 		 * @return name of node step is executing on
 		 */
-		def getHost(stepName: String) = stepActors(stepName).host
+		def getHost(stepName: String) = locals.stepActors(stepName).host
 
 		/**
 		 * Get the actor managing a step
@@ -159,7 +186,7 @@ class WorkflowManager(workflow: WorkflowDefinition, timeID: Long,
 		 *
 		 * @return reference for actor managing step
 		 */
-		def getStepActor(stepName: String) = stepActors(stepName).actor
+		def getStepActor(stepName: String) = locals.stepActors(stepName).actor
 
 		/**
 		 * Can this be a direct pipe
@@ -174,10 +201,19 @@ class WorkflowManager(workflow: WorkflowDefinition, timeID: Long,
 		 * Is output checkpointed
 		 *
  		 * @param output pointer to output file
-		 * @return true if this can not be a direct pipe
+		 * @return true if this output is being checkpointed
 		 */
 		def isCheckpointed(output: DataFilePointer) =
 			workflow.steps(output.stepName).outputs(output.dataName).checkpointAs.isDefined
+
+		/**
+		 * Does output ignore EOF
+		 *
+ 		 * @param output pointer to output file
+		 * @return true if this output ignores EOF
+		 */
+		def isIgnoreEOF(output: DataFilePointer) =
+			workflow.steps(output.stepName).outputs(output.dataName).ignoreEOF.isDefined
 
 		/**
 		 * Will input be "rewound"
@@ -203,7 +239,8 @@ class WorkflowManager(workflow: WorkflowDefinition, timeID: Long,
 		def isPipe(outputSource: DataFilePointer, inputTarget: DataFilePointer) = {
 			inputSizeForOutput(outputSource) == 1 &&
 				getHost(outputSource.stepName) == getHost(inputTarget.stepName) &&
-				!isRewind(inputTarget) && !isNotDirectPipe(outputSource) && !isCheckpointed(outputSource)
+				!isRewind(inputTarget) && !isNotDirectPipe(outputSource) &&
+				!isCheckpointed(outputSource) && !isIgnoreEOF(outputSource)
 		}
 
 		/**
@@ -242,7 +279,7 @@ class WorkflowManager(workflow: WorkflowDefinition, timeID: Long,
 		 * @return socket port # to be used for input server socket
 		 */
 		def getInputPort(input: DataFilePointer) =
-			stepActors(input.stepName).inputPorts(input.dataName)
+			locals.stepActors(input.stepName).inputPorts(input.dataName)
 
 		/* Get socket port of input data */
 		val inputData = getInputPort(inputTarget)
@@ -294,8 +331,8 @@ class WorkflowManager(workflow: WorkflowDefinition, timeID: Long,
 			None
 		} else {
 			val sourceStep = workflow.steps(step).inputs(flow).sourceData.stepName
-			if (stepActors.isSet(sourceStep)) {
-				Some(stepActors(sourceStep).actor)
+			if (locals.stepActors.isSet(sourceStep)) {
+				Some(locals.stepActors(sourceStep).actor)
 			} else None
 		}
 	}
@@ -329,7 +366,7 @@ class WorkflowManager(workflow: WorkflowDefinition, timeID: Long,
 		 * attempt - # of attempts made so far to publish step's availability
 	 	 */
 		case Publish(attempt) => {
-			for (stepName <- stepNames if !stepsTaken.isSet(stepName)) {
+			for (stepName <- locals.stepNames if !locals.stepsTaken.isSet(stepName)) {
 				val step = workflow.steps(stepName)
 				val resources = StepResources(step.resources.coresWanted, step.resources.gbWanted,
 					doTokenSubstitution(step.resources.suggestedScheduler, stepName), step.resources.consumption)
@@ -339,7 +376,7 @@ class WorkflowManager(workflow: WorkflowDefinition, timeID: Long,
 				  ", attempt: " + attempt + ")")
 				bus.publish(NewStep(stepName, WorkflowID(workflow.name, timeID), resources, attempt, self))
 			}
-			if (!stepsTaken.isAllSet) {
+			if (!locals.stepsTaken.isAllSet) {
 				import context.dispatcher
 				context.system.scheduler.scheduleOnce(3000 milliseconds) {
 					self ! Publish(attempt + 1)
@@ -355,12 +392,12 @@ class WorkflowManager(workflow: WorkflowDefinition, timeID: Long,
 		 */
 		case WantStep(name, wfID, schedID) => {
 			if (workflow.steps.get(name).isDefined) {
-				if (!stepsTaken.isSet(name)) {
+				if (!locals.stepsTaken.isSet(name)) {
 					/* Give it to first that asks - the local schedulers should be sure they can handle it */
 					log.info("Giving step " + name + " to " + sender.path.address.toString)
 					val step = workflow.steps(name)
-					sender ! ItsYours(name, wfID, wfTempDir, wfLogDir, workflow.tokens, step)
-					stepsTaken(name) = schedID
+					sender ! ItsYours(name, wfID, locals.wfTempDir, locals.wfLogDir, workflow.tokens, step)
+					locals.stepsTaken(name) = schedID
 				} else {
 					/* Step already taken - tell sender it's not getting the step */
 					log.info("Rejecting request for step " + name + " from " + sender.path.address.toString)
@@ -390,13 +427,13 @@ class WorkflowManager(workflow: WorkflowDefinition, timeID: Long,
 			}
 
 			/* Remember who (actor) is taking step along with socket information for inputs */
-			stepActors(name) = SocketActor(sender, name, host, ports)
+			locals.stepActors(name) = SocketActor(sender, name, host, ports)
 
 			/* If all the steps are taken it's time to ask for the inputs to be setup */
-			if (stepActors.isAllSet) {
+			if (locals.stepActors.isAllSet) {
 				/* For each step there are multiple inputs  - map StepName -> map InputFlowName -> connectionInfo */
 				val inputConnectionInfo : Map[String, Map[String, DataFlow]] =
-					(for (stepName <- stepNames) yield
+					(for (stepName <- locals.stepNames) yield
 						stepName -> (for (inputFlow <- workflow.steps(stepName).inputs) yield
 						{
 							val (inputName, inputData) = inputFlow
@@ -405,8 +442,8 @@ class WorkflowManager(workflow: WorkflowDefinition, timeID: Long,
 						}).toMap).toMap
 
 				/* Send out to each step a list of output sockets to use to communicate to following steps */
-				for (stepName <- stepNames)
-					stepActors(stepName).actor ! SetupInputs(inputConnectionInfo(stepName))
+				for (stepName <- locals.stepNames)
+					locals.stepActors(stepName).actor ! SetupInputs(inputConnectionInfo(stepName))
 			}
 		}
 
@@ -421,21 +458,21 @@ class WorkflowManager(workflow: WorkflowDefinition, timeID: Long,
 			log.info("InputsAreSetup for " + name + " received from " + sender.path.address.toString)
 
 			/* Remember which steps have setup inputs */
-			stepsInputs.set(name)
+			locals.stepsInputs.set(name)
 
 			/* If all inputs setup time to ask for the output to be setup*/
-			if (stepsInputs.isAllSet) {
+			if (locals.stepsInputs.isAllSet) {
 				/* For each step there are multiple outputs which can go to multiple places */
 				val outputConnectionInfo : Map[String, Map[String, Array[DataFlow]]] =
-					(for (stepName <- stepNames) yield
+					(for (stepName <- locals.stepNames) yield
 						stepName -> (for (outputName <- workflow.steps(stepName).outputs.keys) yield
-							outputName -> (for (inputStep <- outputMap.getOrElse(DataFilePointer(stepName, outputName),
+							outputName -> (for (inputStep <- locals.outputMap.getOrElse(DataFilePointer(stepName, outputName),
 								Set.empty[String])) yield
 								getDataFlowConnection(DataFilePointer(stepName, outputName),
 									DataFilePointer(inputStep, outputName))).toArray).toMap).toMap
 				/* Ask each step to setup it's outputs */
-				for (stepName <- stepNames)
-					stepActors(stepName).actor ! SetupOutputs(outputConnectionInfo(stepName))
+				for (stepName <- locals.stepNames)
+					locals.stepActors(stepName).actor ! SetupOutputs(outputConnectionInfo(stepName))
 			}
 		}
 
@@ -446,11 +483,11 @@ class WorkflowManager(workflow: WorkflowDefinition, timeID: Long,
  		 */
 		case StepSetup(name) => {
 			log.info("StepSetup for " + name + " received from " + sender.path.address.toString)
-			stepsStarted.set(name)
+			locals.stepsStarted.set(name)
 			/* If all the steps are setup then tell them to start execution */
-			if (stepsStarted.isAllSet) {
+			if (locals.stepsStarted.isAllSet) {
 				log.info("Starting steps for workflow " + workflow.name + " (time=" + getTimeID(timeID) + ")")
-				stepActors.values.foreach(_.actor ! StartStep)
+				locals.stepActors.values.foreach(_.actor ! StartStep)
 			}
 		}
 
@@ -465,13 +502,18 @@ class WorkflowManager(workflow: WorkflowDefinition, timeID: Long,
 		case StepDone(name, completionStatus) => {
 			log.info("StepDone for " + name + " received from "  + sender.path.address.toString +
 			  ", status: " + completionStatus.toString)
-			stepsDone(name) = completionStatus
-			if (stepsDone.isAllSet) {
-				stepActors.values.foreach(_.actor ! CleanupStep)
+			locals.stepsDone(name) = completionStatus
+			if (locals.stepsDone.isAllSet) {
+				locals.stepActors.foreach((actor) => {
+					val (name, socketActor) = actor
+					/* Don't send message if link to remote scheduler is broken */
+					if (locals.stepsDone(name) != ENOLINK)
+						socketActor.actor ! CleanupStep
+				})
 				val completionStatus =
-					stepActors.keys.foldLeft(0)((composite, stepName) =>
-						if (composite == 0) stepsDone(stepName) else
-							math.max(math.abs(composite), math.abs(stepsDone(stepName))))
+					locals.stepActors.keys.foldLeft(0)((composite, stepName) =>
+						if (composite == 0) locals.stepsDone(stepName) else
+							math.max(math.abs(composite), math.abs(locals.stepsDone(stepName))))
 				replyTo ! WorkflowDone(self.path.name, completionStatus)
 				context.stop(self)
 			} else if (completionStatus != 0) {
@@ -485,7 +527,11 @@ class WorkflowManager(workflow: WorkflowDefinition, timeID: Long,
  		 */
 		case AbortWorkflow => {
 			log.info("Aborting workflow")
-			stepActors.values.foreach(_.actor ! AbortStep)
+			locals.stepActors.foreach((actor) => {
+				val (name, socketActor) = actor
+				if (!locals.stepsDone.isSet(name))
+					socketActor.actor ! AbortStep
+			})
 		}
 
 		/*
@@ -497,16 +543,16 @@ class WorkflowManager(workflow: WorkflowDefinition, timeID: Long,
 		 * What is the state of the workflow.  We send back the state of each step.
  		 */
 		case WhatIsWorkflowState(replyTo: ActorRef) => replyTo ! WorkflowState(RUNNING,
-			stepNames.foldLeft(List.empty[StepState])((listSoFar, stepName) => {
-				val state = if (!stepsTaken.isSet(stepName)) NOT_TAKEN else {
-					if (!stepsStarted.isSet(stepName)) NOT_STARTED else {
-						if (stepsDone.isSet(stepName)) COMPLETED else RUNNING
+			locals.stepNames.foldLeft(List.empty[StepState])((listSoFar, stepName) => {
+				val state = if (!locals.stepsTaken.isSet(stepName)) NOT_TAKEN else {
+					if (!locals.stepsStarted.isSet(stepName)) NOT_STARTED else {
+						if (locals.stepsDone.isSet(stepName)) COMPLETED else RUNNING
 					}
 				}
-				val host = if (stepActors.isSet(stepName)) Some(stepActors(stepName).host) else None
-				val schedID = if (stepsTaken.isSet(stepName)) Some(stepsTaken(stepName)) else None
+				val host = if (locals.stepActors.isSet(stepName)) Some(locals.stepActors(stepName).host) else None
+				val schedID = if (locals.stepsTaken.isSet(stepName)) Some(locals.stepsTaken(stepName)) else None
 
-				val completion = if (state == COMPLETED) Some(stepsDone(stepName)) else None
+				val completion = if (state == COMPLETED) Some(locals.stepsDone(stepName)) else None
 				StepState(stepName,	state, schedID, host, completion) :: listSoFar
 			}))
 
@@ -524,7 +570,24 @@ class WorkflowManager(workflow: WorkflowDefinition, timeID: Long,
 		 * flow - name of flow to resume
 		 * step - name of step flow is being input into
  		 */
-		case ResumeSourceFlow(flow: String, step: String) => changeSourceFlowFlow("resume", flow, step, ResumeFlow(flow))
+		case ResumeSourceFlow(flow: String, step: String) =>
+			changeSourceFlowFlow("resume", flow, step, ResumeFlow(flow))
+
+		/*
+		 * A remote scheduler has aborted - now we go abort any steps that were executing on the remote scheduler
+		 * that haven't completed yet.
+		 *
+		 * address - address of remote scheduler
+ 		 */
+		case SchedulerAbort(address: String) =>
+			locals.stepActors.foreach((actor) => {
+				val (name, socketActor) = actor
+				if (!locals.stepsDone.isSet(name) && socketActor.actor.path.address.toString == address) {
+					log.info("Aborting step " + name + " because remote client (" +
+						address.toString + ") executing step has shutdown")
+					self ! StepDone(name, ENOLINK)
+				}
+			})
 
 		/*
 		 * Unknown message - simple log it

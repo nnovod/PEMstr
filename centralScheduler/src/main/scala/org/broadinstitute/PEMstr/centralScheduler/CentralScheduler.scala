@@ -37,6 +37,7 @@ import org.broadinstitute.PEMstr.common.CentralSchedulerMessages._
 import org.broadinstitute.PEMstr.common.ActorWithContext._
 import org.broadinstitute.PEMstr.common.ActorWithContext
 import org.broadinstitute.PEMstr.common.workflow.WorkflowSplitJoin.splitWorkflow
+import org.broadinstitute.PEMstr.centralScheduler.CentralScheduler.SchedulerAbort
 
 /**
  * @author Nathaniel Novod
@@ -137,6 +138,8 @@ class CentralScheduler extends ActorWithContext {
 				}
 				case None =>
 			}
+			/* Tell all workflow managers about the abort so they can check if any steps need to be aborted */
+			locals.workflows.valuesIterator.foreach(_ ! SchedulerAbort(address.toString))
 		}
 
 		/*
@@ -203,4 +206,15 @@ class CentralScheduler extends ActorWithContext {
  		 */
 		case e => log.warning("received unknown message: " + e)
 	}
+}
+
+
+object CentralScheduler {
+
+	/**
+	 * Message sent when a local scheduler goes down
+	 *
+	 * @param clientAddress
+	 */
+	case class SchedulerAbort(clientAddress: String)
 }
